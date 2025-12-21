@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# Environment variables (sensitive)
+.env
+.env.local
+
+# Logs
+*.log
+logs/
+panic.log
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+data/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Evolution snapshots (large, can be regenerated)
+_remote_evo_snapshot/
+
+# Temporary files
+*.tmp
+*.bak
+*.cache
+
+# Persona optimization logs
+persona_optimization/logs/
+
+# Analysis reports (can be regenerated)
+analysis/reports/
+analysis/overnight_report/
+
