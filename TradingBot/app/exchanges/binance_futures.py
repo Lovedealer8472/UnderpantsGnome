@@ -752,11 +752,29 @@ class BinanceFuturesExchange(ExchangeBase):
                             "info": {"msg": f"Amount {amount} < min_qty {min_qty}"}
                         }
                         
-                    # 2. Min Notional Check (approximate using price)
-                    if min_cost and price:
-                        notional = amount * price
-                        if notional < min_cost:
-                            self.logger.warning(f"Order value ${notional:.2f} < min_cost ${min_cost} for {symbol}. Skipping.")
+                    # 2. Min Notional Check (BINANCE BEST PRACTICE: Validate before order placement)
+                    # For market orders, price is None - must fetch current price for notional calculation
+                    if min_cost:
+                        notional = None
+                        if price:
+                            # Limit order: use provided price
+                            notional = amount * price
+                        else:
+                            # Market order: fetch current price for notional calculation
+                            try:
+                                ticker = await self.exchange.fetch_ticker(symbol)
+                                current_price = ticker.get('last') or ticker.get('close') or ticker.get('bid')
+                                if current_price:
+                                    notional = amount * current_price
+                                    self.logger.debug(f"[NOTIONAL_CHECK] Market order: using current price {current_price} for {symbol}")
+                                else:
+                                    self.logger.warning(f"[NOTIONAL_CHECK] Could not get current price for {symbol}, skipping notional check")
+                            except Exception as e:
+                                self.logger.debug(f"[NOTIONAL_CHECK] Failed to fetch price for notional check: {e}")
+                                # Continue without notional check - exchange will reject if too small
+                        
+                        if notional and notional < min_cost:
+                            self.logger.warning(f"[NOTIONAL_CHECK] Order value ${notional:.2f} < min_cost ${min_cost} for {symbol}. Skipping.")
                             return {
                                 "id": None,
                                 "status": "rejected",
@@ -787,18 +805,58 @@ class BinanceFuturesExchange(ExchangeBase):
                 self.logger.debug(f"Precision formatting/check failed for {symbol}: {e}. Using raw amount.")
                 final_amount = amount
 
-            return await self.exchange.create_order(
-                symbol, order_type, side, final_amount, price, params
+            # CRITICAL: Log before calling CCXT create_order
+            self.logger.warning(
+                f"[BINANCE_ORDER_CALL] {symbol} {side} {final_amount:.6f}: "
+                f"Calling CCXT create_order (type={order_type}, price={price})"
             )
+            
+            try:
+                order_result = await self.exchange.create_order(
+                    symbol, order_type, side, final_amount, price, params
+                )
+                
+                # CRITICAL: Log the result from CCXT
+                self.logger.warning(
+                    f"[BINANCE_ORDER_RESULT] {symbol} {side}: "
+                    f"CCXT returned id={order_result.get('id')}, status={order_result.get('status')}, "
+                    f"filled={order_result.get('filled')}, amount={order_result.get('amount')}"
+                )
+                
+                return order_result
+            except Exception as e:
+                # GUARD: Log -4140 (Invalid symbol status) as warning, not error
+                # This is expected behavior for symbols in "Reduce Only" mode or temporarily unavailable
+                error_str = str(e)
+                exchange_symbol = self.denormalize_symbol(symbol) # For logging
+                if "-4140" in error_str or "Invalid symbol status" in error_str:
+                    self.logger.warning(f"Symbol unavailable for new positions: {exchange_symbol} ({error_str[:60]})")
+                else:
+                    self.logger.error(
+                        f"[BINANCE_ORDER_ERROR] {exchange_symbol} {side} {amount}: "
+                        f"{type(e).__name__}: {error_str}"
+                    )
+                    import traceback
+                    self.logger.error(f"[BINANCE_ORDER_ERROR_TRACEBACK] {traceback.format_exc()}")
+                raise
         except Exception as e:
-            # GUARD: Log -4140 (Invalid symbol status) as warning, not error
-            # This is expected behavior for symbols in "Reduce Only" mode or temporarily unavailable
+            # Outer exception handler for the entire create_order function
             error_str = str(e)
-            exchange_symbol = self.denormalize_symbol(symbol) # For logging
-            if "-4140" in error_str or "Invalid symbol status" in error_str:
-                self.logger.debug(f"Symbol unavailable for new positions: {exchange_symbol} ({error_str[:60]})")
+            exchange_symbol = self.denormalize_symbol(symbol) if hasattr(self, 'denormalize_symbol') else symbol
+            
+            # Check for Binance -4140 error (Invalid symbol status) - log at DEBUG level
+            is_invalid_symbol = "-4140" in error_str or "Invalid symbol status" in error_str
+            if is_invalid_symbol:
+                self.logger.debug(
+                    f"[BINANCE_ORDER_INVALID_SYMBOL] {exchange_symbol} {side} {amount}: "
+                    f"Symbol in Reduce Only mode or delisted (-4140). Skipping order."
+                )
             else:
-                self.logger.error(f"Error creating order {exchange_symbol} {side} {amount}: {e}")
+                # Other errors - log at ERROR level
+                self.logger.error(
+                    f"[BINANCE_ORDER_OUTER_ERROR] {exchange_symbol} {side} {amount}: "
+                    f"{type(e).__name__}: {error_str}"
+                )
             raise
     
     async def set_leverage(self, leverage: int, symbol: str, params: Optional[Dict] = None):
@@ -914,12 +972,17 @@ class BinanceFuturesExchange(ExchangeBase):
                 return None
             
             # Clamp callback rate to Binance limits (0.1% - 5%)
-            callback_rate = max(0.1, min(5.0, callback_rate))
+            callback_rate_pct = max(0.1, min(5.0, callback_rate))
+            
+            # CRITICAL: Binance requires callbackRate in basis points (BIPS), not percentage!
+            # 1 basis point = 0.01%, so 2.5% = 250 basis points
+            # Convert percentage to basis points
+            callback_rate_bips = callback_rate_pct * 100  # 2.5% -> 250 basis points
             
             # Build params for TRAILING_STOP_MARKET order
-            # Binance requires: callbackRate (mandatory), activationPrice (optional)
+            # Binance requires: callbackRate in basis points (mandatory), activationPrice (optional)
             params = {
-                'callbackRate': callback_rate,  # Trailing distance in %
+                'callbackRate': callback_rate_bips,  # Trailing distance in basis points (e.g., 250 = 2.5%)
                 'reduceOnly': True,
             }
             
@@ -932,10 +995,13 @@ class BinanceFuturesExchange(ExchangeBase):
             
             self.logger.info(
                 f"[TRAIL] Placing TRAILING_STOP_MARKET: {symbol} {side} {final_amount} "
-                f"@ {callback_rate}% callback (current: ${current_price:.4f})"
+                f"@ {callback_rate_pct}% callback ({callback_rate_bips} bips) (current: ${current_price:.4f}) - Will follow price up!"
             )
             
-            # Place the REAL trailing stop order
+            # Place the REAL trailing stop order - Binance will automatically:
+            # 1. Follow price upward as it moves favorably
+            # 2. Keep stop price trailing by callback_rate% behind peak
+            # 3. Execute when price reverses and hits trailing stop
             order = await self.exchange.create_order(
                 symbol,
                 'TRAILING_STOP_MARKET',  # TRUE trailing stop order type
@@ -945,22 +1011,75 @@ class BinanceFuturesExchange(ExchangeBase):
                 params
             )
             
-            self.logger.info(f"[TRAIL] SUCCESS: {symbol} trailing stop placed @ {callback_rate}% callback")
+            order_id = order.get('id') or order.get('orderId') or order.get('clientOrderId', 'UNKNOWN')
+            # Extract actual callback rate from response (might be in bips)
+            response_callback = order.get('callbackRate', callback_rate_bips)
+            # If response is in bips, convert to percentage for logging
+            if response_callback > 10:  # Likely in bips (250) not percentage (2.5)
+                response_callback_pct = response_callback / 100.0
+            else:
+                response_callback_pct = response_callback
+            self.logger.info(
+                f"[TRAIL] ✅ SUCCESS: {symbol} trailing stop placed @ {response_callback_pct}% callback "
+                f"(Order ID: {order_id}) - Following price upward, will catch reversals!"
+            )
+            
+            # CRITICAL: Verify the trailing stop was actually placed
+            try:
+                await asyncio.sleep(0.5)  # Brief delay to allow order to appear
+                verify_orders = await self.fetch_stop_orders(symbol)
+                found = any(
+                    (o.get('id') == str(order_id) or o.get('id') == order_id or 
+                     o.get('orderId') == str(order_id) or o.get('clientOrderId') == str(order_id))
+                    for o in verify_orders
+                )
+                if found:
+                    self.logger.info(f"[TRAIL] ✅ VERIFIED: Trailing stop {order_id} confirmed active on Binance - following price!")
+                else:
+                    self.logger.warning(
+                        f"[TRAIL] ⚠️ WARNING: Trailing stop {order_id} not found in open orders. "
+                        f"It may still be active but not yet visible. Check Binance UI."
+                    )
+            except Exception as verify_err:
+                self.logger.warning(f"[TRAIL] Could not verify trailing stop {order_id}: {verify_err}")
+            
             return order
             
         except Exception as e:
             error_str = str(e)
-            if "ReduceOnly" in error_str:
-                self.logger.debug(f"[TRAIL] Skipped (no position): {symbol}")
-            elif "notional" in error_str.lower() or "MIN_NOTIONAL" in error_str:
-                self.logger.debug(f"[TRAIL] Skipped (too small): {symbol}")
-            elif "4046" in error_str or "not supported" in error_str.lower():
-                # Fallback: Some symbols don't support TRAILING_STOP_MARKET
+            error_code = None
+            if hasattr(e, 'code'):
+                error_code = e.code
+            elif "code" in str(e):
+                # Try to extract error code from error string (e.g., "code":-4140)
+                import re
+                match = re.search(r'"code":(-?\d+)', error_str)
+                if match:
+                    error_code = int(match.group(1))
+            
+            # Log detailed error information
+            self.logger.error(f"[TRAIL] FAILED for {symbol}: {e} (code: {error_code})")
+            
+            if "ReduceOnly" in error_str or "-4140" in error_str:
+                # Position doesn't exist or symbol status invalid
+                self.logger.warning(f"[TRAIL] Position not found or invalid for {symbol}, trying static stop")
+                return await self._place_static_stop(symbol, side, final_amount, callback_rate, current_price)
+            elif "notional" in error_str.lower() or "MIN_NOTIONAL" in error_str or "-4141" in error_str:
+                # Position too small
+                self.logger.warning(f"[TRAIL] Position too small for {symbol} (size: {final_amount}), trying static stop")
+                return await self._place_static_stop(symbol, side, final_amount, callback_rate, current_price)
+            elif "4046" in error_str or "not supported" in error_str.lower() or error_code == -4046:
+                # Symbol doesn't support TRAILING_STOP_MARKET
                 self.logger.warning(f"[TRAIL] Symbol {symbol} doesn't support trailing stop, using static stop")
                 return await self._place_static_stop(symbol, side, final_amount, callback_rate, current_price)
+            elif "-2010" in error_str or error_code == -2010:
+                # NEW_ORDER_REJECTED - might be insufficient margin or other order rejection
+                self.logger.warning(f"[TRAIL] Order rejected for {symbol}, trying static stop")
+                return await self._place_static_stop(symbol, side, final_amount, callback_rate, current_price)
             else:
-                self.logger.warning(f"[TRAIL] FAILED for {symbol}: {e}")
-            return None
+                # Unknown error - try static stop as fallback
+                self.logger.warning(f"[TRAIL] Unknown error for {symbol}, attempting static stop as fallback")
+                return await self._place_static_stop(symbol, side, final_amount, callback_rate, current_price)
     
     async def _place_static_stop(
         self,
