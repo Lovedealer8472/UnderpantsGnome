@@ -40,8 +40,11 @@ load_dotenv(override=True)
 # This ensures config.py reads the correct values via env()
 # =============================================================================
 os.environ.setdefault("USE_SIGNAL_PERCENTILE_FILTER", "1")  # Enable percentile-based filtering
-os.environ.setdefault("SIGNAL_PERCENTILE_THRESHOLD", "0.90")  # Top 10% of signals (90th percentile) - Selective cherry picking
+os.environ.setdefault("SIGNAL_PERCENTILE_THRESHOLD", "0.93")  # Top 7% of signals (93rd percentile) - Selective filtering
 os.environ.setdefault("SIGNAL_HISTORY_SIZE", "100")  # Track last 100 signals
+
+# SAFETY: Force disable Binance trailing stops (use internal only - more reliable)
+os.environ["USE_BINANCE_TRAILING_STOP"] = "0"  # Override any .env setting
 
 # Import config (this will load .env and defaults, but our env vars take precedence)
 import app.config as config
@@ -92,14 +95,14 @@ def check_market_regime():
     
     if btc_vol is not None:
         if btc_vol < 1.0:
-            warnings.append(f"⚠️ Low volatility ({btc_vol:.1f}%) - ranging market")
+            warnings.append(f"[WARNING] Low volatility ({btc_vol:.1f}%) - ranging market")
         elif btc_vol > 12.0:
-            warnings.append(f"⚠️ High volatility ({btc_vol:.1f}%) - chaotic conditions")
+            warnings.append(f"[WARNING] High volatility ({btc_vol:.1f}%) - chaotic conditions")
     
     if funding is not None:
         if abs(funding) > 0.05:  # >0.05% funding = crowded trade
             direction = "LONGS" if funding > 0 else "SHORTS"
-            warnings.append(f"⚠️ Extreme funding ({funding:.3f}%) - {direction} crowded")
+            warnings.append(f"[WARNING] Extreme funding ({funding:.3f}%) - {direction} crowded")
     
     return regime_ok, warnings, btc_vol, funding
 
@@ -111,9 +114,9 @@ def pre_flight_checks():
     # 1. Internet Connectivity
     try:
         requests.get("https://www.google.com", timeout=3)
-        print("✅ Internet: Connected")
+        print("[OK] Internet: Connected")
     except Exception:
-        print("❌ Internet: FAILED")
+        print("[X] Internet: FAILED")
         sys.exit(1)
         
     # 2. Time Sync (Crucial for Binance)
@@ -122,24 +125,24 @@ def pre_flight_checks():
         local_time = int(time.time() * 1000)
         diff = abs(server_time - local_time)
         if diff > 1000:
-            print(f"⚠️ Time Sync: WARNING (Diff {diff}ms)")
+            print(f"[WARNING] Time Sync: WARNING (Diff {diff}ms)")
         else:
-            print(f"✅ Time Sync: OK ({diff}ms)")
+            print(f"[OK] Time Sync: OK ({diff}ms)")
     except Exception as e:
-        print(f"⚠️ Time Sync: Check failed ({e})")
+        print(f"[WARNING] Time Sync: Check failed ({e})")
 
     # 3. API Keys
     key = os.getenv("BINANCE_API_KEY") or config.BINANCE_API_KEY
     if not key or len(key) < 60:
-        print(f"❌ API Key: INVALID (Length: {len(key) if key else 0})")
+        print(f"[X] API Key: INVALID (Length: {len(key) if key else 0})")
         sys.exit(1)
     else:
-        print(f"✅ API Key: {key[:4]}...{key[-4:]}")
+        print(f"[OK] API Key: {key[:4]}...{key[-4:]}")
 
     # 4. Market Regime Check
     regime_ok, warnings, btc_vol, funding = check_market_regime()
-    print(f"✅ BTC Volatility: {btc_vol:.1f}%" if btc_vol else "⚠️ BTC Vol: Unknown")
-    print(f"✅ Funding Rate: {funding:.4f}%" if funding else "⚠️ Funding: Unknown")
+    print(f"[OK] BTC Volatility: {btc_vol:.1f}%" if btc_vol else "[WARNING] BTC Vol: Unknown")
+    print(f"[OK] Funding Rate: {funding:.4f}%" if funding else "[WARNING] Funding: Unknown")
     
     for w in warnings:
         print(f"   {w}")
@@ -150,7 +153,7 @@ def pre_flight_checks():
     mins_to_funding = ((next_funding_hour - now_utc.hour) % 24) * 60 - now_utc.minute
     if mins_to_funding < 0:
         mins_to_funding += 24 * 60
-    print(f"✅ UTC Time: {now_utc.strftime('%H:%M')} (Funding in {mins_to_funding}min)")
+    print(f"[OK] UTC Time: {now_utc.strftime('%H:%M')} (Funding in {mins_to_funding}min)")
     
     print("="*60 + "\n")
 
@@ -232,18 +235,30 @@ config.USE_TRAILING_ENGINE = True  # Enable trailing stop engine
 config.USE_NEW_TRAILING_ENGINE = True  # Use new trailing engine
 config.USE_ATR_TRAILING_STOP = False  # Legacy ATR trailing - OFF
 
-# Binance Server-Side Stop-Loss (Circuit Breaker)
-# This places a stop-loss order on Binance for disaster protection
-# Should be WIDER than bot's internal trailing (which handles normal exits)
-config.USE_BINANCE_TRAILING_STOP = True  # Enable Binance stop-loss orders
-config.BINANCE_TRAILING_CALLBACK_RATE = 3.0  # 3.0% stop distance (circuit breaker - wide enough to not interfere)
+# Binance Server-Side Stop-Loss - DISABLED
+# Using bot's internal trailing stop system instead (more reliable, better control)
+# The bot's internal trailing engine handles stop-loss updates automatically
+# Bot monitors positions and updates stops as price moves favorably
+# SAFETY: Force disable (override any .env or config.py default)
+config.USE_BINANCE_TRAILING_STOP = False  # Disabled - using internal trailing system
+config.BINANCE_TRAILING_CALLBACK_RATE = 2.5  # Not used when disabled
 
-# Trailing Stop Settings (R-based engine)
-config.TRAIL_ENGINE_START_BUFFER_R = 0.3  # Start trailing at 0.3R (activate early)
+# VERIFICATION: Log to confirm setting
+print(f"[CONFIG] USE_BINANCE_TRAILING_STOP = {config.USE_BINANCE_TRAILING_STOP} (should be False)")
+if config.USE_BINANCE_TRAILING_STOP:
+    print("⚠️  WARNING: Binance trailing stops are ENABLED - this may cause issues!")
+    print("   Setting to False for safety...")
+    config.USE_BINANCE_TRAILING_STOP = False
+else:
+    print("✅ Binance trailing stops DISABLED - using internal trailing system (recommended)")
+
+# Trailing Stop Settings (R-based engine) - AGGRESSIVE TRAILING
+# Strategy: Start trailing at 1.0R to let winners run, then trail aggressively
+config.TRAIL_ENGINE_START_BUFFER_R = 1.0  # Start trailing at 1.0R (let winners run first)
 config.TRAIL_ENGINE_PARTIAL_1_R = 1.0  # First partial at +1R
 config.TRAIL_ENGINE_PARTIAL_1_SIZE = 0.25  # 25% clip at 1R
-config.TRAIL_ENGINE_BREAK_EVEN_R = 1.5  # Move to BE at 1.5R
-config.TRAIL_ENGINE_BE_BUFFER_R = 0.25  # Buffer above BE
+config.TRAIL_ENGINE_BREAK_EVEN_R = 1.0  # Move to BE at 1.0R (sooner protection)
+config.TRAIL_ENGINE_BE_BUFFER_R = 0.1  # Tighter buffer for aggressive trailing
 
 # Stale Position Management (Prevent dead weight)
 config.MAX_POSITION_AGE_SEC = 3600  # 1 hour max hold (60 minutes)
@@ -256,23 +271,28 @@ config.STALE_POSITION_PNL_THRESHOLD = 0.3  # Auto-close if |PnL| < 0.3% after ma
 # SECTION 5: LIVE TRADING CORE
 # =============================================================================
 
-config.DRY_RUN = False       # 💰 REAL MONEY MODE
+config.DRY_RUN = False       # REAL MONEY MODE
 config.REPLAY_MODE = False
 config.MARGIN_MODE = "CROSS"
 config.EXCHANGE = "binance_futures"
 
 # Startup warmup: Full market scan before allowing trades
 # This builds signal history so percentile filter (top 1%) has good data to work with
-config.STARTUP_DELAY_SEC = 60  # 60 seconds for full market scan (was 30s)
+config.STARTUP_DELAY_SEC = 10  # 10 seconds for quick warmup (reduced for testing)
 
 # =============================================================================
 # SECTION 6: RISK MANAGEMENT (SWARM STRATEGY)
 # =============================================================================
 
-config.RISK_PER_TRADE_PCT = 5.0       # 5% per trade
-config.MAX_OPEN_POSITIONS = 10        # Reduced to prevent dust (was 20)
-config.MAX_CONCURRENT_POS = 10
-config.MAX_CONCURRENT_POS_HARD = 10
+# Position limits - ALL set to 10 to ensure exactly 10 positions available
+config.MAX_OPEN_POSITIONS = 10        # Maximum positions
+config.MAX_CONCURRENT_POS = 10        # Same as above  
+config.MAX_CONCURRENT_POS_HARD = 10   # Hard cap (cannot exceed)
+config.MAX_CONCURRENT_POS_MIN = 10    # Minimum (ensures 10 available, overrides config.py default of 5)
+config.MAX_CONCURRENT_POS_MAX = 10    # Maximum (same as MIN to lock at exactly 10)
+
+# Risk budget settings - adjusted to support 10 positions
+config.RISK_PER_TRADE_PCT = 5.0       # 5% per trade (with 100% total risk, allows 20 positions, clamped to 10 by HARD cap)
 # Position sizing limits - AGGRESSIVE ANTI-DUST SETTINGS
 # Increased significantly to prevent 0.0x positions that clog the machine
 config.MIN_POSITION_SIZE = 20.0       # Increased to $20 to prevent dust (0.0x positions)
@@ -294,42 +314,47 @@ config.RPA_MIN_SIZE_USD = 20.0        # Must match MIN_POSITION_SIZE to prevent 
 # SECTION 7: SIGNAL QUALITY FILTERS
 # =============================================================================
 
-# SIGNAL FILTERS - ADAPTIVE PERCENTILE-BASED SYSTEM
+# SIGNAL FILTERS - ULTRA SELECTIVE PERCENTILE-BASED SYSTEM (STRICT MODE)
 # ML outputs 25-50 range (win probability * 100)
 # Use percentile filtering to automatically adapt to market conditions
-# If many signals score 41+, only top 20% will pass
-# If few signals score 41+, more will pass (dynamic threshold)
-config.MIN_SIGNAL_SCORE = 40.0        # Base floor - must be 40+ to even be considered
-config.MIN_SIGNAL_STRENGTH = 0.40     # Match score/100
-config.HARD_MIN_SCORE = 40            # Absolute minimum - FORCE percentile filter to work (must be 40+ to even be considered)
+# STRICT: Only 51-52+ scores, top 2% percentile filtering
+# Raises the bar to maximum - only the absolute best signals pass
+# SIMPLIFIED ENTRY SYSTEM: Single source of truth
+config.MIN_SIGNAL_SCORE = 51.0        # Normal mode: minimum score to enter (51+)
+config.IDLE_MIN_SCORE = 42.0          # Idle mode: minimum score when no positions (42+)
+config.MIN_SIGNAL_STRENGTH = 0.51     # Match score/100
+# REMOVED: HARD_MIN_SCORE - using MIN_SIGNAL_SCORE as single threshold
 config.MIN_SCORE_RANGE = (25, 50)     # ML Scorer output range - MUST override config.py
 config.MIN_STRENGTH_RANGE = (0.25, 0.50)  # Match score range
 
 # ADAPTIVE PERCENTILE FILTERING (Environment variables set above before config import)
 # This filters to top X% of recent signals, automatically adjusting threshold
-# If 50 signals score 41+, only top 20% (10 signals) will pass
-# If only 5 signals score 41+, most/all will pass (adaptive!)
+# SELECTIVE: Top 7% - balanced filtering
 # Also set on config object for any code that reads directly
 config.USE_SIGNAL_PERCENTILE_FILTER = True
-config.SIGNAL_PERCENTILE_THRESHOLD = 0.90  # Top 10% - Selective cherry picking (top quality signals)
+config.SIGNAL_PERCENTILE_THRESHOLD = 0.93  # Top 7% - Selective filtering, best signals (93rd percentile)
 config.SIGNAL_HISTORY_SIZE = 100
 
-# SELECTIVE CHERRY PICKING: Top 10% (0.90) - Only the best signals pass
-# - Strict filtering - rejects 90% of signals above the base threshold
-# - With 100 signals scoring 40+, only the top 10 will pass
-# - Good balance between selectivity and staying active
-# Note: SIGNAL_PERCENTILE_THRESHOLD is a float 0.0-1.0 where 0.90 = 90th percentile = top 10%
+# SELECTIVE CHERRY PICKING: Top 7% (0.93) - Balanced quality focus
+# - Pre-filter: Only signals scoring 51+ are considered (excellent quality pool)
+# - Percentile filter: From that excellent pool, only top 7% pass
+# - With 100 signals scoring 51+, only the top 7 will pass
+# - Selective - balanced quality, good trade frequency
+# Note: SIGNAL_PERCENTILE_THRESHOLD is a float 0.0-1.0 where 0.93 = 93rd percentile = top 7%
 
-# CRITICAL: Disable IDLE_RELAX - it was allowing Score 59 garbage through!
-config.IDLE_RELAX_ENABLED = False     # NO RELAXING - percentile handles adaptation
+# SIMPLIFIED: Idle mode uses fixed IDLE_MIN_SCORE (42.0) - no complex relaxation logic
+config.IDLE_RELAX_ENABLED = False     # Disabled - using simple IDLE_MIN_SCORE instead
 
-# UNLOCK entry filters - allow adaptive percentile system to work
-# But don't let regime adapter override - we use percentile instead
-os.environ["LOCK_ENTRY_FILTERS"] = "0"  # Allow percentile filtering to work
-config.LOCK_ENTRY_FILTERS = False
+# LOCK entry filters - prevent regime adapter from overriding optimized settings
+# We use percentile filtering as our dynamic system (adapts to recent signal scores)
+# The regime adapter would override our optimized 47.0/0.98 settings with lower values (28-32)
+os.environ["LOCK_ENTRY_FILTERS"] = "1"  # Lock to prevent regime adapter override
+config.LOCK_ENTRY_FILTERS = True
 
-# Correlation: Disabled for swarm strategy (ride the wave)
-config.CORRELATION_BLOCK_THRESHOLD = 0
+# Correlation: Allow up to 3 correlated positions (ride the wave with intelligent exits)
+# Max 3 positions in correlated assets - but allow riding waves with fast/intelligent exits
+config.CORRELATION_BLOCK_THRESHOLD = 0.96  # Only block if correlation > 0.96 (very high correlation)
+config.CORRELATION_THRESHOLD = 3  # Allow up to 3 correlated positions before penalty
 
 # =============================================================================
 # SECTION 8: MICROSTRUCTURE LIMITS
@@ -346,37 +371,37 @@ config.SYMBOLS_TO_SCAN = 60           # Elite 60 symbols
 config.DISCOVERY_SCAN_INTERVAL_SEC = 5.0
 config.LOG_LEVEL = "INFO"
 config.COOLDOWN_AFTER_EXIT = 60       # 1min cooldown after exit
-config.MAX_ENTRIES_PER_MIN = 2        # Prevent runaway
+config.MAX_ENTRIES_PER_MIN = 5        # Allow 5 entries/min for active trading
 
 # =============================================================================
 # STARTUP OUTPUT
 # =============================================================================
 
-print(f"\n📊 CONFIGURATION SUMMARY")
+print(f"\nCONFIGURATION SUMMARY")
 print("-"*40)
-print(f"MODE:     {'🚀 Quick Scalp' if QUICK_SCALP_ENABLED else '📈 Standard R-Based'}")
-print(f"LIVE:     {'💰 REAL MONEY' if not config.DRY_RUN else '📝 Paper Trading'}")
+print(f"MODE:     {'Quick Scalp' if QUICK_SCALP_ENABLED else 'Standard R-Based'}")
+print(f"LIVE:     {'REAL MONEY' if not config.DRY_RUN else 'Paper Trading'}")
 print(f"MARGIN:   {config.MARGIN_MODE}")
 print(f"EXCHANGE: {config.EXCHANGE}")
 print("-"*40)
 print(f"RISK:     {config.RISK_PER_TRADE_PCT}% per trade")
-print(f"MAX POS:  {config.MAX_OPEN_POSITIONS}")
+print(f"MAX POS:  {config.MAX_OPEN_POSITIONS} (MIN={config.MAX_CONCURRENT_POS_MIN}, MAX={config.MAX_CONCURRENT_POS_MAX}, HARD={config.MAX_CONCURRENT_POS_HARD})")
 print(f"SIZE:     ${config.MIN_POSITION_SIZE}-${config.MAX_POSITION_SIZE}")
 print("-"*40)
-print(f"MIN SCORE:    {config.MIN_SIGNAL_SCORE}")
+print(f"MIN SCORE:    {config.MIN_SIGNAL_SCORE} (HARD={config.HARD_MIN_SCORE}, TOP {(1-config.SIGNAL_PERCENTILE_THRESHOLD)*100:.0f}%)")
 print(f"SKIP PROB:    35% (introspection-optimal)")
 print(f"SLIPPAGE:     {config.SLIPPAGE_BPS} bps (realistic)")
 print("-"*40)
 print("SAFETY FEATURES:")
-print(f"  🛡️ Cost Gate:        {config.COST_GATE_ENABLED}")
-print(f"  💥 Spread Explosion:  {config.SPREAD_EXPLOSION_EXIT_ENABLED}")
-print(f"  ⏰ Funding Avoidance: {config.FUNDING_AVOIDANCE_ENABLED}")
-print(f"  📊 Regime Filter:     {config.REGIME_FILTER_ENABLED}")
-print(f"  🕐 Time Filter:       {config.TIME_FILTER_ENABLED}")
+print(f"  Cost Gate:           {config.COST_GATE_ENABLED}")
+print(f"  Spread Explosion:    {config.SPREAD_EXPLOSION_EXIT_ENABLED}")
+print(f"  Funding Avoidance:   {config.FUNDING_AVOIDANCE_ENABLED}")
+print(f"  Regime Filter:        {config.REGIME_FILTER_ENABLED}")
+print(f"  Time Filter:          {config.TIME_FILTER_ENABLED}")
 print("-"*40)
 print(f"EXITS: SL={config.DRY_SIMPLE_SL_R}R | TP={config.DRY_SIMPLE_TP_R}R")
 print("="*60)
-print("⚠️  WARNING: REAL MONEY WILL BE USED")
+print("[WARNING] REAL MONEY WILL BE USED")
 print("    Monitor Binance Dashboard closely!")
 print("="*60 + "\n")
 

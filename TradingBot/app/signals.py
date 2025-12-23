@@ -235,21 +235,98 @@ class SignalGenerator:
         
         return result
     
+    def _calculate_adaptive_percentile(self) -> float:
+        """
+        Calculate adaptive percentile threshold based on signal availability.
+        
+        Strategy:
+        - When many signals available (>20 scoring above floor): Use 0.99 (top 1%) - very selective
+        - When moderate signals (10-20): Use 0.95 (top 5%) - balanced
+        - When few signals (<10): Use 0.90 (top 10%) or lower - more accepting
+        - Goal: Always trade on best available signals, adapt to market conditions
+        
+        Returns:
+            Adaptive percentile threshold (0.0-1.0)
+        """
+        from . import config as cfg
+        # Use current relaxed floor if in idle mode (may be lower than HARD_MIN_SCORE)
+        # Otherwise use HARD_MIN_SCORE
+        hard_min = getattr(cfg, 'HARD_MIN_SCORE', 45)
+        base_percentile = SIGNAL_PERCENTILE_THRESHOLD  # Start with configured value
+        
+        # Count how many quality signals we have in recent history
+        quality_signals = []
+        for signal_record in self.signal_history[-SIGNAL_HISTORY_SIZE:]:
+            final_score = signal_record.get('final_score', 0.0)
+            if final_score >= hard_min:
+                quality_signals.append(final_score)
+        
+        quality_count = len(quality_signals)
+        
+        # ADAPTIVE PERCENTILE: Adjust based on signal availability
+        if quality_count >= 20:
+            # Many signals available - be VERY selective (top 1%)
+            adaptive_pct = 0.99
+            reason = "many_signals"
+        elif quality_count >= 10:
+            # Moderate signals - balanced selectivity (top 5%)
+            adaptive_pct = 0.95
+            reason = "moderate_signals"
+        elif quality_count >= 5:
+            # Few signals - more accepting (top 10%)
+            adaptive_pct = 0.90
+            reason = "few_signals"
+        else:
+            # Very few signals - be accepting (top 20%)
+            adaptive_pct = 0.80
+            reason = "very_few_signals"
+        
+        # Use adaptive percentile, but respect configured minimum/maximum
+        # Allow override if explicitly set very high/low
+        if base_percentile >= 0.98:
+            # If configured to be very selective (0.98+), respect that but can be more selective
+            adaptive_pct = max(adaptive_pct, base_percentile)
+        elif base_percentile <= 0.80:
+            # If configured to be very accepting, respect that
+            adaptive_pct = min(adaptive_pct, base_percentile)
+        
+        # Cache for logging (only log changes)
+        if not hasattr(self, '_last_adaptive_pct') or abs(self._last_adaptive_pct - adaptive_pct) > 0.01:
+            if not hasattr(self, '_last_adaptive_pct_log') or time.time() - self._last_adaptive_pct_log > 60:
+                from .logger import get_logger
+                logger = get_logger("SignalGenerator")
+                logger.info(
+                    f"[ADAPTIVE_PCT] Quality signals: {quality_count} | "
+                    f"Percentile: {base_percentile:.2f} -> {adaptive_pct:.2f} ({reason}) | "
+                    f"Top {int((1-adaptive_pct)*100)}% filtering - {'VERY SELECTIVE' if adaptive_pct >= 0.99 else 'BALANCED' if adaptive_pct >= 0.95 else 'ACCEPTING'}"
+                )
+                self._last_adaptive_pct_log = time.time()
+            self._last_adaptive_pct = adaptive_pct
+        
+        return adaptive_pct
+    
     def _is_in_top_percentile(self, signal_score: float, percentile_threshold: float = None) -> bool:
         """
         Check if signal score is in top percentile of recent signals.
         OPTIMIZED: Caches percentile threshold calculation.
+        ADAPTIVE: Automatically adjusts percentile based on signal availability.
         
         Args:
             signal_score: Final score of the signal (0-100)
-            percentile_threshold: Optional percentile threshold (0-1), uses dynamic if None
+            percentile_threshold: Optional percentile threshold (0-1), uses adaptive if None
         
         Returns:
             True if signal is in top percentile, False otherwise
-            If history is too small (< 20 signals), uses relaxed fallback (75+) instead of 80+
+            If history is too small (< 20 signals), uses relaxed fallback
         """
-        # Use provided percentile threshold or default
-        pct_threshold = percentile_threshold if percentile_threshold is not None else SIGNAL_PERCENTILE_THRESHOLD
+        # Use provided percentile threshold, or calculate adaptive threshold
+        if percentile_threshold is not None:
+            pct_threshold = percentile_threshold
+        elif USE_SIGNAL_PERCENTILE_FILTER:
+            # ADAPTIVE: Calculate percentile based on signal availability
+            pct_threshold = self._calculate_adaptive_percentile()
+        else:
+            pct_threshold = SIGNAL_PERCENTILE_THRESHOLD
         
         # Need at least 20 signals for reliable percentile calculation
         # When history is insufficient, use MIN_SIGNAL_SCORE as fallback
@@ -263,15 +340,15 @@ class SignalGenerator:
         if self._cached_threshold is None or self._cached_history_size != history_size or \
            abs(self._cached_percentile - pct_threshold) > 0.001:
             # Extract final scores from recent history (limit to SIGNAL_HISTORY_SIZE)
-            # CHERRY PICKING: Only consider signals that passed HARD_MIN_SCORE for percentile calculation
-            # This ensures percentile filter works on the pool of viable signals (40+), making it truly selective
+            # SIMPLIFIED: Only consider signals that passed MIN_SIGNAL_SCORE for percentile calculation
+            # This ensures percentile filter works on a pre-filtered quality pool, making it truly selective
             from . import config as cfg
-            hard_min = getattr(cfg, 'HARD_MIN_SCORE', 40)
+            min_score = float(getattr(cfg, 'MIN_SIGNAL_SCORE', 51.0))  # Only quality signals in pool
             recent_scores = []
             for signal_record in self.signal_history[-SIGNAL_HISTORY_SIZE:]:
                 final_score = signal_record.get('final_score', 0.0)
-                # Only include signals that would have passed HARD_MIN_SCORE (viable pool for percentile filtering)
-                if final_score >= hard_min:
+                # Only include signals that would have passed MIN_SIGNAL_SCORE (viable pool for percentile filtering)
+                if final_score >= min_score:
                     recent_scores.append(final_score)
             
             if len(recent_scores) < 20:
@@ -340,7 +417,9 @@ class SignalGenerator:
         bot_positions: Optional[Dict] = None,  # SCORING V2: For portfolio scoring
         market_regime: str = "neutral",  # New parameter for Marksman regime filter
         min_score_override: Optional[float] = None,  # Dynamic override
-        min_strength_override: Optional[float] = None  # Dynamic override
+        min_strength_override: Optional[float] = None,  # Dynamic override
+        skip_percentile_filter: bool = False,  # IDLE MODE: Skip percentile filter to find best available signal
+        idle_mode_active: bool = False  # IDLE MODE: Allow signals below HARD_MIN_SCORE when idle
     ) -> Tuple[Optional[TradingSignal], Optional[str]]:
         """
         Generate trading signal for symbol.
@@ -608,19 +687,42 @@ class SignalGenerator:
         # has accurate distribution (includes low-scoring signals that get rejected)
         self._add_to_history(symbol, best_signal.final_score, best_signal.strength)
         
-        from . import config as cfg
-        hard_min = getattr(cfg, 'HARD_MIN_SCORE', 40)
-        if score_to_check < hard_min:
+        # SIMPLIFIED: Single score check - no complex logic
+        # Garbage filter: reject signals below 20 (invalid/garbage)
+        if score_to_check < 20:
             self._filter_stats['rejected_hard_min'] += 1
-            return None, f"ML_floor:{score_to_check:.1f}<{hard_min}"
+            return None, f"ML_floor:{score_to_check:.1f}<20(garbage)"
+        # Note: Main score threshold check happens in bot.py (simplified logic)
         # ============================================================
         
         # Check percentile threshold (only accept top X% of recent signals) - use dynamic percentile
         # ADAPTIVE FILTERING: Reject signals that don't meet percentile threshold
         # This automatically adapts - if many signals score 41+, only top X% pass
         # NOTE: Signal already added to history above (before hard_min check)
-        if USE_SIGNAL_PERCENTILE_FILTER and percentile_threshold > 0.0 and len(self.signal_history) >= 20:
-            if not self._is_in_top_percentile(best_signal.final_score, percentile_threshold):
+        # IDLE MODE: Skip percentile filter when skip_percentile_filter=True (to find best available signal when no positions)
+        if not skip_percentile_filter and USE_SIGNAL_PERCENTILE_FILTER and percentile_threshold > 0.0 and len(self.signal_history) >= 20:
+            is_in_top = self._is_in_top_percentile(best_signal.final_score, percentile_threshold)
+            # CRITICAL: Log percentile filter decision for debugging
+            try:
+                from .logger import get_logger
+                logger = get_logger("SignalGenerator")
+                # Calculate rank for logging
+                recent_scores = [s.get('final_score', 0) for s in self.signal_history[-100:]]
+                recent_scores_sorted = sorted(recent_scores, reverse=True)
+                rank = len([s for s in recent_scores_sorted if s > best_signal.final_score]) + 1
+                total_signals = len(recent_scores_sorted)
+                percentile_pct = percentile_threshold * 100
+                top_count = max(1, int(total_signals * (1.0 - percentile_threshold)))
+                logger.warning(
+                    f"[PERCENTILE_FILTER] {symbol} score={best_signal.final_score:.1f}: "
+                    f"threshold={percentile_threshold:.3f} ({percentile_pct:.1f}th), "
+                    f"rank={rank}/{total_signals}, top_count={top_count}, "
+                    f"passed={is_in_top}"
+                )
+            except Exception:
+                pass  # Don't break signal generation if logging fails
+            
+            if not is_in_top:
                 # Signal not in top percentile - reject it
                 self._filter_stats['rejected_percentile'] += 1
                 percentile_pct = percentile_threshold * 100
@@ -745,12 +847,29 @@ class SignalGenerator:
         stop_loss_pct = atr_pct * SL_ATR_MULTIPLIER
         take_profit_pct = stop_loss_pct * 3.0  # 3:1 risk:reward ratio
         
+        # CRITICAL FIX: Clamp percentages to prevent negative take_profit for SHORT positions
+        # If take_profit_pct > 1.0, then (1 - take_profit_pct) would be negative
+        # Cap at 0.95 (95%) to ensure take_profit is always positive
+        take_profit_pct = min(take_profit_pct, 0.95)  # Max 95% for safety
+        stop_loss_pct = min(stop_loss_pct, 0.95)  # Max 95% for safety
+        
         if side == "long":
             stop_loss = entry_price * (1 - stop_loss_pct)
             take_profit = entry_price * (1 + take_profit_pct)
         else:
             stop_loss = entry_price * (1 + stop_loss_pct)
             take_profit = entry_price * (1 - take_profit_pct)
+            
+            # CRITICAL FIX: Ensure take_profit is positive and below entry_price for SHORT
+            # If calculation produces invalid value, use a safe default (0.5% below entry)
+            if take_profit <= 0 or take_profit >= entry_price:
+                take_profit = entry_price * 0.995  # 0.5% below entry as safe fallback
+                from .logger import get_logger
+                logger = get_logger("SignalGenerator")
+                logger.warning(
+                    f"[TAKE_PROFIT_FIX] {symbol} SHORT: Invalid take_profit calculated, "
+                    f"using safe fallback: {take_profit:.4f} (entry: {entry_price:.4f})"
+                )
         
         return TradingSignal(
             symbol=symbol,
