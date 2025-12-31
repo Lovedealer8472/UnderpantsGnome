@@ -83,6 +83,35 @@ class BinanceFuturesExchange(ExchangeBase):
         # binanceusdm has proper futures support, while binance() with defaultType='future' doesn't
         self.exchange = ccxt_async.binanceusdm(options)
         
+        # [CRITICAL FIX] Synchronize time with Binance server to fix -1021 "Timestamp ahead" errors
+        # This is essential before any authenticated requests (orders, positions, etc.)
+        try:
+            self.logger.info("[TIME_SYNC] Synchronizing local time with Binance server...")
+            server_time = await self.exchange.fetch_time()  # Get server timestamp in ms
+            local_time = int(time.time() * 1000)
+            time_offset = local_time - server_time
+            
+            # CCXT stores this internally as self.exchange.nonce_offset
+            # Set it explicitly to ensure all requests use corrected timestamps
+            if hasattr(self.exchange, 'nonce_offset'):
+                self.exchange.nonce_offset = time_offset
+                self.logger.info(f"[TIME_SYNC] OK: Offset={time_offset}ms (local {'ahead' if time_offset > 0 else 'behind'} by {abs(time_offset)}ms)")
+            
+            # Also update the explicit time_offset if available
+            if hasattr(self.exchange, 'timeOffset'):
+                self.exchange.timeOffset = time_offset
+            
+            # Log warning if offset is large (>500ms)
+            if abs(time_offset) > 500:
+                self.logger.warning(
+                    f"[TIME_SYNC] WARNING: Large time offset detected! Local time is {abs(time_offset)}ms "
+                    f"{'ahead' if time_offset > 0 else 'behind'} of Binance. "
+                    f"Check your system clock! This will cause -1021 errors if not fixed."
+                )
+        except Exception as e:
+            self.logger.warning(f"[TIME_SYNC] Could not synchronize time with Binance: {e}. Will use local time. This may cause -1021 errors.")
+            self.logger.warning("[TIME_SYNC] If you see -1021 errors, check your system clock and restart the bot.")
+        
         # Enable testnet if configured
         if self.testnet:
             try:
@@ -143,6 +172,35 @@ class BinanceFuturesExchange(ExchangeBase):
                 api_secret_configured=bool(self.api_secret)
             )
             raise last_err
+    
+    async def resync_time(self):
+        """
+        Resynchronize local time with Binance server.
+        Call this if you see -1021 errors (timestamp too far ahead).
+        """
+        if not self.exchange:
+            self.logger.warning("[TIME_SYNC] Exchange not initialized, cannot resync time")
+            return
+        
+        try:
+            self.logger.info("[TIME_SYNC] Resyncing time with Binance...")
+            server_time = await self.exchange.fetch_time()  # Get server timestamp in ms
+            local_time = int(time.time() * 1000)
+            time_offset = local_time - server_time
+            
+            # Update nonce_offset
+            if hasattr(self.exchange, 'nonce_offset'):
+                old_offset = getattr(self.exchange, 'nonce_offset', 0)
+                self.exchange.nonce_offset = time_offset
+                self.logger.info(f"[TIME_SYNC] Updated offset from {old_offset}ms to {time_offset}ms")
+            
+            if hasattr(self.exchange, 'timeOffset'):
+                self.exchange.timeOffset = time_offset
+            
+            if abs(time_offset) > 500:
+                self.logger.warning(f"[TIME_SYNC] WARNING: Large offset {time_offset}ms - check system clock!")
+        except Exception as e:
+            self.logger.error(f"[TIME_SYNC] Resync failed: {e}")
     
     async def load_markets(self, reload: bool = False, params: Optional[Dict] = None) -> Dict[str, Any]:
         """Load markets from Binance Futures."""
@@ -685,6 +743,11 @@ class BinanceFuturesExchange(ExchangeBase):
         if not self.exchange:
             return []
         try:
+            # Check if exchange has a valid connection (prevent NoneType errors)
+            if not hasattr(self.exchange, 'fetch_positions'):
+                self.logger.warning("Exchange object missing fetch_positions method")
+                return []
+            
             # Ensure params is always a dict (CCXT requires it)
             if params is None:
                 params = {}
@@ -692,8 +755,40 @@ class BinanceFuturesExchange(ExchangeBase):
             positions = await self.exchange.fetch_positions(symbols, params=params)
             # Filter for open positions only (contracts != 0)
             return [p for p in positions if p.get("contracts", 0) != 0]
+        except AttributeError as e:
+            # Handle cases where exchange connection is None or broken
+            if "'NoneType'" in str(e) or "getaddrinfo" in str(e):
+                self.logger.warning(f"Exchange connection lost or invalid: {e}. Will retry on next sync.")
+            else:
+                self.logger.warning(f"Error fetching positions (AttributeError): {e}")
+            return []
         except Exception as e:
-            self.logger.warning(f"Error fetching positions: {e}")
+            # Handle network errors and other exceptions gracefully
+            error_str = str(e)
+            if "'NoneType'" in error_str or "getaddrinfo" in error_str or "connection" in error_str.lower():
+                self.logger.warning(f"Network error fetching positions: {e}. Exchange connection may be lost.")
+            else:
+                self.logger.warning(f"Error fetching positions: {e}")
+            return []
+    
+    async def fetch_orders(self, symbol: Optional[str] = None, since: Optional[int] = None, 
+                          limit: Optional[int] = None, params: Optional[Dict] = None) -> List[Dict[str, Any]]:
+        """Fetch orders for a symbol."""
+        if not self.exchange:
+            return []
+        try:
+            if not hasattr(self.exchange, 'fetch_orders'):
+                self.logger.warning("Exchange object missing fetch_orders method")
+                return []
+            
+            if params is None:
+                params = {}
+            
+            # Fetch orders (CCXT handles pagination and filtering)
+            orders = await self.exchange.fetch_orders(symbol, since=since, limit=limit, params=params)
+            return orders
+        except Exception as e:
+            self.logger.warning(f"Error fetching orders for {symbol}: {e}")
             return []
     
     async def create_order(self, symbol: str, order_type: str, side: str,
@@ -829,6 +924,22 @@ class BinanceFuturesExchange(ExchangeBase):
                 # This is expected behavior for symbols in "Reduce Only" mode or temporarily unavailable
                 error_str = str(e)
                 exchange_symbol = self.denormalize_symbol(symbol) # For logging
+                
+                # [CRITICAL FIX] Handle -1021 timestamp errors by resyncing time
+                if "-1021" in error_str or "Timestamp" in error_str and "ahead" in error_str:
+                    self.logger.error(
+                        f"[BINANCE_ORDER_NONCE_ERROR] Detected -1021 timestamp error. "
+                        f"Local clock is too far ahead. Attempting automatic resync..."
+                    )
+                    try:
+                        await self.resync_time()
+                        self.logger.info("[BINANCE_ORDER_NONCE_ERROR] Time resynced. Retry this order.")
+                    except Exception as resync_err:
+                        self.logger.error(f"[BINANCE_ORDER_NONCE_ERROR] Resync failed: {resync_err}")
+                    
+                    # Re-raise so the order manager can retry
+                    raise
+                
                 if "-4140" in error_str or "Invalid symbol status" in error_str:
                     self.logger.warning(f"Symbol unavailable for new positions: {exchange_symbol} ({error_str[:60]})")
                 else:

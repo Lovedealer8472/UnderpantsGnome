@@ -25,7 +25,7 @@ class GovernedExchange(ExchangeBase):
                 setattr(self, name, getattr(inner, name))
 
     async def initialize(self):
-        return await self._gov.call(cost=5, lane="universe", fn=lambda: self._inner.initialize(), timeout_sec=30.0)
+        return await self._gov.call(cost=10, lane="universe", fn=lambda: self._inner.initialize(), timeout_sec=30.0)
 
     async def load_markets(self, reload: bool = False, params: Optional[Dict] = None) -> Dict[str, Any]:
         return await self._gov.call(cost=10, lane="universe", fn=lambda: self._inner.load_markets(reload=reload, params=params), timeout_sec=30.0)
@@ -34,8 +34,8 @@ class GovernedExchange(ExchangeBase):
         return await self._gov.call(cost=1, lane="scan", fn=lambda: self._inner.fetch_ticker(symbol))
 
     async def fetch_tickers(self, symbols: Optional[List[str]] = None, params: Optional[Dict] = None) -> Dict[str, Any]:
-        # Batch tickers can be heavier, but still bounded.
-        return await self._gov.call(cost=5, lane="universe", fn=lambda: self._inner.fetch_tickers(symbols=symbols, params=params), timeout_sec=15.0)
+        # Batch tickers are heavy (weight=40 for all tickers)
+        return await self._gov.call(cost=40, lane="universe", fn=lambda: self._inner.fetch_tickers(symbols=symbols, params=params), timeout_sec=15.0)
 
     async def fetch_ohlcv(self, symbol: str, timeframe: str = "1m", limit: int = 100, params: Optional[Dict] = None) -> List[List]:
         return await self._gov.call(cost=1, lane="scan", fn=lambda: self._inner.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit, params=params))
@@ -47,7 +47,12 @@ class GovernedExchange(ExchangeBase):
         return await self._gov.call(cost=5, lane="pos", fn=lambda: self._inner.fetch_balance(params=params))
 
     async def fetch_positions(self, symbols: Optional[List[str]] = None, params: Optional[Dict] = None) -> List[Dict[str, Any]]:
-        return await self._gov.call(cost=5, lane="pos", fn=lambda: self._inner.fetch_positions(symbols=symbols, params=params))
+        return await self._gov.call(cost=40, lane="pos", fn=lambda: self._inner.fetch_positions(symbols=symbols, params=params))
+
+    async def fetch_orders(self, symbol: Optional[str] = None, since: Optional[int] = None, 
+                          limit: Optional[int] = None, params: Optional[Dict] = None) -> List[Dict[str, Any]]:
+        # Order history is moderate weight (5 per request)
+        return await self._gov.call(cost=5, lane="pos", fn=lambda: self._inner.fetch_orders(symbol=symbol, since=since, limit=limit, params=params))
 
     async def create_order(
         self,

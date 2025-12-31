@@ -180,80 +180,44 @@ def validate_stop_loss_take_profit(
 ) -> Tuple[float, float]:
     """
     Validate stop loss and take profit relative to entry price.
-    
+
     Args:
         entry_price: Entry price
         stop_loss: Stop loss price
         take_profit: Take profit price
         side: Position side (long/short)
-        
+
     Returns:
         Tuple of (validated_stop_loss, validated_take_profit)
-        
+
     Raises:
         ValidationError: If stop loss or take profit is invalid
     """
     entry_price = validate_price(entry_price, "entry_price")
     side = validate_side(side)
-    
-    if stop_loss is not None:
-        stop_loss = validate_price(stop_loss, "stop_loss")
-        
-        if side == "long":
-            if stop_loss >= entry_price:
-                raise ValidationError(
-                    f"Stop loss ({stop_loss}) must be below entry price ({entry_price}) for long position"
-                )
-        else:  # short
-            if stop_loss <= entry_price:
-                raise ValidationError(
-                    f"Stop loss ({stop_loss}) must be above entry price ({entry_price}) for short position"
-                )
-    else:
+
+    # Validate stop loss
+    if stop_loss is None:
         raise ValidationError("Stop loss is required")
-    
-    if take_profit is not None:
-        take_profit_float = float(take_profit)
-        
-        # CRITICAL FIX: Handle edge case where take_profit might be a percentage/difference
-        # If negative and very small, it's likely a calculation error
-        # For SHORT positions, if take_profit is negative, recalculate from entry_price
-        if take_profit_float < 0:
-            # This is a calculation error - take_profit should never be negative
-            # For SHORT, use a safe default (0.5% below entry)
-            if side == "short":
-                take_profit_float = entry_price * 0.995  # 0.5% below entry as safe fallback
-                from .logger import get_logger
-                logger = get_logger("Validators")
-                logger.warning(
-                    f"[TAKE_PROFIT_FIX] SHORT position: Invalid negative take_profit ({take_profit}), "
-                    f"using safe fallback: {take_profit_float:.4f} (entry: {entry_price:.4f})"
-                )
-            else:
-                raise ValidationError(f"take_profit must be positive, got {take_profit_float}")
-        
-        # Validate it's a reasonable positive price
-        if take_profit_float <= 0:
-            raise ValidationError(f"take_profit must be positive, got {take_profit_float}")
-        
-        if take_profit_float > 1e10:
-            raise ValidationError(f"take_profit is unreasonably large: {take_profit_float}")
-        
-        take_profit = take_profit_float
-        
-        if side == "long":
-            if take_profit <= entry_price:
-                raise ValidationError(
-                    f"Take profit ({take_profit}) must be above entry price ({entry_price}) for long position"
-                )
-        else:  # short
-            if take_profit >= entry_price:
-                raise ValidationError(
-                    f"Take profit ({take_profit}) must be below entry price ({entry_price}) for short position"
-                )
-    else:
+
+    stop_loss = validate_price(stop_loss, "stop_loss")
+
+    if side == "long" and stop_loss >= entry_price:
+        raise ValidationError(f"Stop loss ({stop_loss}) must be below entry price ({entry_price}) for long position")
+    elif side == "short" and stop_loss <= entry_price:
+        raise ValidationError(f"Stop loss ({stop_loss}) must be above entry price ({entry_price}) for short position")
+
+    # Validate take profit
+    if take_profit is None:
         raise ValidationError("Take profit is required")
-    
+
+    take_profit = validate_price(take_profit, "take_profit")
+
+    if side == "long" and take_profit <= entry_price:
+        raise ValidationError(f"Take profit ({take_profit}) must be above entry price ({entry_price}) for long position")
+    elif side == "short" and take_profit >= entry_price:
+        raise ValidationError(f"Take profit ({take_profit}) must be below entry price ({entry_price}) for short position")
+
     return stop_loss, take_profit
 
 

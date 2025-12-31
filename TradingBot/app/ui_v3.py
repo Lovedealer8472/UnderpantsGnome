@@ -178,14 +178,16 @@ class UIv3:
         root["main"]["positions"].update(self._build_positions_panel(snapshot))
         root["main"]["tape"].update(self._build_tape_panel(bot))
         
-        # Bottom: Split Logs (Left) and Jail (Right)
+        # Bottom: Split Logs (Left), Config (Center), and Jail (Right)
         root["bottom"].split_row(
-            Layout(name="logs", ratio=8),
+            Layout(name="logs", ratio=6),
+            Layout(name="config", ratio=2),
             Layout(name="jail", ratio=2)
         )
         
         root["bottom"]["logs"].update(self._build_log_panel())
-        root["bottom"]["jail"].update(self._build_jail_panel(bot))
+        root["bottom"]["config"].update(self._build_config_panel(bot))
+        root["bottom"]["jail"].update(self._build_binance_panel(bot))
         
         return root
 
@@ -201,22 +203,12 @@ class UIv3:
         # Position count
         num_positions = risk.open_positions
         
-        # ADAPTIVE ENTRY: Get current adaptive state
-        adaptive = getattr(bot, 'adaptive_entry', None)
-        if adaptive:
-            adaptive_state = adaptive.get_state(num_positions)
-            active_score = adaptive_state.current_threshold
-            base_threshold = adaptive_state.base_threshold
-            decay_adj = adaptive_state.decay_adjustment
-            mins_idle = adaptive_state.minutes_since_last_entry
-            avg_signal = adaptive_state.avg_signal_score
-        else:
-            # Fallback if adaptive not available
-            active_score = float(getattr(bot, 'dynamic_gate_score', 35.0))
-            base_threshold = active_score
-            decay_adj = 0.0
-            mins_idle = 0.0
-            avg_signal = 0.0
+        # ML-OPTIMIZED: Get fixed threshold from config (no adaptive lowering)
+        active_score = float(getattr(bot, 'dynamic_gate_score', 50.0))
+        base_threshold = active_score
+        decay_adj = 0.0
+        mins_idle = 0.0
+        avg_signal = 0.0
         
         # Rate limit info
         pm = getattr(bot, 'position_manager', None)
@@ -243,27 +235,38 @@ class UIv3:
         # Center: ADAPTIVE Scoring
         center = Text()
         # Color based on how aggressive (lower = more aggressive)
-        if active_score <= 30:
+        # RECALIBRATED for Dec 2025 score distribution (48-59 range)
+        if active_score <= 45:
             score_style = "bold red"
-            mode_label = "HUNT"
-        elif active_score <= 40:
-            score_style = "bold yellow"
-            mode_label = "SEEK"
+            mode_label = "HUNT"  # Very aggressive (allows 68%+ of signals)
         elif active_score <= 50:
+            score_style = "bold yellow"
+            mode_label = "SEEK"  # Aggressive (allows 62.5% of signals)
+        elif active_score <= 55:
             score_style = "bold green"
-            mode_label = "NORM"
+            mode_label = "NORM"  # Normal (allows ~40% of signals)
         else:
             score_style = "bold cyan"
-            mode_label = "PICK"
+            mode_label = "PICK"  # Selective (allows <20% of signals)
+        
+        # Get actual MIN_SIGNAL_SCORE from config (ML-optimized)
+        import os
+        min_signal_score = int(os.getenv('MIN_SIGNAL_SCORE', '10'))
+        hard_min_score = int(os.getenv('HARD_MIN_SCORE', '5'))
         
         center.append(f"GATE: {active_score:.0f}+", style=score_style)
         center.append(f" [{mode_label}]\n", style="dim")
-        # Show what's influencing threshold
-        if decay_adj > 0:
-            center.append(f"base={base_threshold:.0f} ", style="dim")
-            center.append(f"-{decay_adj:.0f}decay", style="yellow")
+        # Show ML config if different from adaptive threshold
+        if min_signal_score != int(active_score):
+            center.append(f"ML: {min_signal_score}+ ", style="bright_white")
+            center.append(f"(floor={hard_min_score})", style="dim")
         else:
-            center.append(f"avg_sig={avg_signal:.0f}", style="dim")
+            # Show what's influencing threshold
+            if decay_adj > 0:
+                center.append(f"base={base_threshold:.0f} ", style="dim")
+                center.append(f"-{decay_adj:.0f}decay", style="yellow")
+            else:
+                center.append(f"avg_sig={avg_signal:.0f}", style="dim")
         
         # Right: PnL Hero
         right = Text("EQUITY: ", style="dim")
@@ -281,7 +284,8 @@ class UIv3:
         table.add_column("SIDE", justify="center")
         table.add_column("PNL $", justify="right")
         table.add_column("PNL %", justify="right")
-        table.add_column("SCORE", justify="center")
+        table.add_column("TRAIL", justify="right", style="cyan")  # NEW: Trailing stop info
+        table.add_column("PEAK %", justify="right", style="yellow")  # NEW: Peak profit
         table.add_column("AGE", justify="right")
         table.add_column("SIZE", justify="right")
         
@@ -301,22 +305,47 @@ class UIv3:
             pnl_c = "green" if pos.pnl_value >= 0 else "red"
             side_c = "green" if pos.side == "LONG" else "red"
             
-            # ML Scorer: 25-50 range. 45+ exceptional, 40+ good, 35+ decent
-            if pos.score >= 45:
-                score_c = "bold magenta"  # Exceptional
-            elif pos.score >= 40:
-                score_c = "bold green"    # Good
-            elif pos.score >= 35:
-                score_c = "green"         # Decent
+            # Calculate trailing stop info
+            entry_price = getattr(pos, 'entry_price', 0)
+            current_price = getattr(pos, 'current_price', entry_price)
+            stop_loss = getattr(pos, 'stop_loss', 0)
+            peak_pnl = getattr(pos, 'peak_pnl', pos.pnl_pct)
+            
+            # Calculate trail distance from current price
+            if stop_loss > 0 and current_price > 0:
+                if pos.side == "LONG":
+                    trail_dist_pct = ((current_price - stop_loss) / current_price) * 100
+                else:  # SHORT
+                    trail_dist_pct = ((stop_loss - current_price) / current_price) * 100
+                
+                # Color based on trail tightness
+                if trail_dist_pct < 1.0:
+                    trail_c = "bold red"  # Very tight (< 1%)
+                elif trail_dist_pct < 2.0:
+                    trail_c = "yellow"  # Tight (1-2%)
+                else:
+                    trail_c = "cyan"  # Normal (> 2%)
+                
+                trail_str = f"{trail_dist_pct:.1f}%"
             else:
-                score_c = "yellow"        # Marginal
+                trail_str = "N/A"
+                trail_c = "dim"
+            
+            # Peak PnL color
+            if peak_pnl > pos.pnl_pct + 2.0:
+                peak_c = "bold red"  # Gave back > 2%
+            elif peak_pnl > pos.pnl_pct + 0.5:
+                peak_c = "yellow"  # Gave back > 0.5%
+            else:
+                peak_c = "green"  # At or near peak
             
             table.add_row(
                 pos.symbol.split("/")[0],
                 Text(pos.side[:1], style=side_c),
                 Text(f"{pos.pnl_value:+.2f}", style=pnl_c),
                 Text(f"{pos.pnl_pct:+.2f}%", style=pnl_c),
-                Text(f"{pos.score:.0f}", style=score_c),
+                Text(trail_str, style=trail_c),
+                Text(f"{peak_pnl:+.1f}%", style=peak_c),
                 pos.age_str,
                 f"{pos.size_pct:.1f}%"
             )
@@ -379,23 +408,33 @@ class UIv3:
             # Metrics display: [5.2% | 3bp]
             metrics = Text(f"[{vol:.1f}%|{spread:.0f}bp] ", style=vol_c)
             
-            # Color score (ML SCORER V3: 25-50 range)
-            if score >= 45:
+            # Color score (ML SCORER V4: 48-59 range, Dec 2025)
+            # Determine exit profile based on score
+            if score >= 58:
                 score_c = "bold magenta"
-                status = "🦄 UNI"  # ML: 45+ = exceptional
+                exit_profile = "RUN"  # Runner profile (58+)
+            elif score >= 53:
+                score_c = "bold cyan"  # Standard profile (53-57)
+                exit_profile = "STD"
+            elif score >= 45:
+                score_c = "green"  # Scalp profile (45-52)
+                exit_profile = "SCP"
             elif score >= 40:
-                score_c = "bold cyan"  # ML: 40-44 = very good
-            elif score >= 35:
-                score_c = "green"  # ML: 35-39 = good
-            elif score >= 30:
-                score_c = "yellow"  # ML: 30-34 = decent
+                score_c = "yellow"  # Below threshold but close
+                exit_profile = "LOW"
             else:
-                score_c = "dim"
+                score_c = "dim"  # Too low
+                exit_profile = "---"
             
             line = Text()
             line.append(f"{time_str} ", style="dim")
             line.append(f"{sym:<6} ", style="bold white")
-            line.append(f"{score:>4.1f} ", style=score_c)
+            line.append(f"{score:>4.1f}", style=score_c)
+            # Add exit profile indicator for approved signals
+            if approved:
+                line.append(f"[{exit_profile}] ", style=score_c)
+            else:
+                line.append(" ", style="dim")
             line.append(metrics) # Insert metrics before status/reason
             line.append(f"{status:<5} ", style=style)
             line.append(f"{reason_display}", style="dim")
@@ -420,22 +459,86 @@ class UIv3:
             
         return Panel(content, title="[bold]SYSTEM LOG[/bold]", border_style="dim", box=box.ROUNDED)
 
-    def _build_jail_panel(self, bot) -> Panel:
-        strikes = len(getattr(bot, '_trash_strikes', {}))
-        inmates = len(getattr(bot, '_trash_jail', {}))
+    def _build_config_panel(self, bot) -> Panel:
+        """Display ML-optimized config status."""
+        import os
         
-        # Get last jailed symbol if any
-        jail_dict = getattr(bot, '_trash_jail', {})
-        last_jailed = list(jail_dict.keys())[-1] if jail_dict else "None"
+        # Get ML config from environment
+        min_score = int(os.getenv('MIN_SIGNAL_SCORE', '10'))
+        hard_min = int(os.getenv('HARD_MIN_SCORE', '5'))
+        scalp_min = int(os.getenv('R_EXIT_SCALP_SCORE_MIN', '45'))
+        scalp_max = int(os.getenv('R_EXIT_SCALP_SCORE_MAX', '52'))
+        std_min = int(os.getenv('R_EXIT_STANDARD_SCORE_MIN', '53'))
+        std_max = int(os.getenv('R_EXIT_STANDARD_SCORE_MAX', '57'))
+        runner_min = int(os.getenv('R_EXIT_RUNNER_SCORE_MIN', '58'))
+        sl_atr = float(os.getenv('SL_ATR_MULTIPLIER', '2.5'))
+        risk_pct = float(os.getenv('RISK_PER_TRADE_PCT', '0.5'))
         
         content = Text()
-        content.append(f"STRIKES: ", style="dim")
-        content.append(f"{strikes}\n", style="yellow")
         
-        content.append(f"JAILED:  ", style="dim")
-        content.append(f"{inmates}\n", style="bold red")
+        # Entry thresholds
+        content.append("ENTRY\n", style="bold white")
+        content.append(f"Min: {min_score}+\n", style="green")
+        content.append(f"Floor: {hard_min}+\n", style="dim")
         
-        content.append(f"LAST:    ", style="dim")
-        content.append(f"{last_jailed[:6]}", style="dim white")
+        # Exit profiles
+        content.append("\nEXITS\n", style="bold white")
+        content.append(f"Scp:{scalp_min}-{scalp_max}\n", style="green")
+        content.append(f"Std:{std_min}-{std_max}\n", style="cyan")
+        content.append(f"Run:{runner_min}+\n", style="magenta")
         
-        return Panel(content, title="[bold]TRASH BIN[/bold]", border_style="dim", box=box.ROUNDED)
+        # Risk
+        content.append(f"\nSL:{sl_atr:.1f}x\n", style="dim")
+        content.append(f"R:{risk_pct:.1f}%", style="dim")
+        
+        return Panel(content, title="[bold]ML CFG[/bold]", border_style="green", box=box.ROUNDED)
+    
+    def _build_binance_panel(self, bot) -> Panel:
+        """Display Binance sync status and position verification."""
+        content = Text()
+        
+        # Get bot positions
+        bot_positions = len(getattr(bot, 'positions', {}))
+        
+        # Get cached Binance position count
+        binance_count = getattr(bot, '_cached_binance_position_count', 0)
+        
+        # Last sync time
+        last_sync = getattr(bot, '_last_pos_sync', 0)
+        if last_sync > 0:
+            sync_ago = time.time() - last_sync
+            if sync_ago < 60:
+                sync_str = f"{sync_ago:.0f}s"
+                sync_c = "green"
+            else:
+                sync_str = f"{sync_ago/60:.0f}m"
+                sync_c = "yellow"
+        else:
+            sync_str = "N/A"
+            sync_c = "dim"
+        
+        # Sync status
+        if bot_positions == binance_count:
+            status = "SYNCED"
+            status_c = "bold green"
+        elif bot_positions > binance_count:
+            status = "GHOST"
+            status_c = "bold red"
+        else:
+            status = "MISSING"
+            status_c = "bold yellow"
+        
+        content.append("BINANCE\n", style="bold white")
+        content.append(f"Bot: ", style="dim")
+        content.append(f"{bot_positions}\n", style="white")
+        
+        content.append(f"Exch: ", style="dim")
+        content.append(f"{binance_count}\n", style="white")
+        
+        content.append(f"Sync: ", style="dim")
+        content.append(f"{sync_str}\n", style=sync_c)
+        
+        content.append(f"Stat: ", style="dim")
+        content.append(f"{status}", style=status_c)
+        
+        return Panel(content, title="[bold]EXCHANGE[/bold]", border_style="cyan", box=box.ROUNDED)

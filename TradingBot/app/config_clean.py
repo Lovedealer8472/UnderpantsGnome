@@ -186,10 +186,10 @@ class CleanConfig:
             max_entries_per_min=_legacy.MAX_ENTRIES_PER_MIN,
         )
         
-        # Consolidate exit config - use DRY_SIMPLE values as base
+        # Consolidate exit config - use sensible defaults
         exit_cfg = ExitConfig(
-            stop_loss_r=_legacy.DRY_SIMPLE_SL_R,
-            take_profit_r=_legacy.DRY_SIMPLE_TP_R,
+            stop_loss_r=1.0,  # Default: 1R stop loss
+            take_profit_r=2.0,  # Default: 2R take profit
             trail_activation_r=_legacy.TRAIL_ENGINE_START_BUFFER_R,
             trail_distance_r=0.5,  # Sensible default
             max_position_age_sec=_legacy.MAX_POSITION_AGE_SEC,

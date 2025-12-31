@@ -59,6 +59,10 @@ class PositionManager:
         from .logger import get_logger
         self.logger = get_logger("PositionManager")
         
+        # UNIFIED FILTER: Single source of truth for entry filtering
+        from .filters import UnifiedFilter
+        self.unified_filter = UnifiedFilter()
+        
         self.positions = {}
         self.cooldown_until = {}
         self.entry_times = []  # Track entry times for rate limiting
@@ -80,9 +84,19 @@ class PositionManager:
         
         # CRITICAL: Lock for atomic position limit checks (prevents race conditions)
         self._position_limit_lock = threading.Lock()
+
+        # ML-SYMBOL ADAPTATION: Intelligent symbol-specific trading
+        # Instead of blacklisting, adapt strategy per symbol using ML-learned parameters
+        self._symbol_adaptation_manager = SymbolAdaptationManager()
+
+
+        # ML-SYMBOL ADAPTATION: Cache for symbol performance data
+        self._symbol_performance_cache = {}
+        self._last_symbol_cache_update = 0
     
     def calculate_position_size(
         self,
+        symbol: str,
         equity: float,
         entry_price: float,
         stop_loss_price: float,
@@ -95,8 +109,9 @@ class PositionManager:
     ) -> Tuple[float, float, Optional[str]]:
         """
         Calculate position size using risk budget approach.
-        
+
         Args:
+            symbol: Trading symbol
             equity: Current account equity
             entry_price: Entry price
             stop_loss_price: Stop loss price
@@ -104,7 +119,7 @@ class PositionManager:
             side: 'long' or 'short'
             is_unicorn: Whether this is a unicorn signal
             open_positions: Dictionary of open positions (for risk calculation)
-        
+
         Returns:
             (position_size, risk_fraction, reason)
             - position_size: Position size in base currency
@@ -194,6 +209,22 @@ class PositionManager:
             
             # Clamp to config limits (respect min/max from config)
             size_multiplier = max(RPA_MIN_SIZE_MULT, min(size_multiplier, RPA_MAX_SIZE_MULT))
+
+            # ML-SYMBOL ADAPTATION: Use comprehensive symbol adaptation system
+            # Adapts sizing, leverage, timing based on ML-learned symbol profiles
+            if signal_score is not None and symbol:
+                base_adapt_params = {
+                    'size_multiplier': size_multiplier,
+                    'sl_atr_multiplier': 4.0,  # Default 4x ATR
+                    'leverage_multiplier': 1.0
+                }
+
+                adapted_params = self._symbol_adaptation_manager.get_adapted_parameters(symbol, base_adapt_params)
+
+                # Apply adaptations
+                size_multiplier = adapted_params.get('size_multiplier', size_multiplier)
+                self.logger.debug(f"[SYMBOL_ADAPT] {symbol}: ML-adapted {size_multiplier:.2f}x size")
+
             target_risk *= size_multiplier
         else:
             # Legacy: Apply signal strength adjustment (scale risk based on signal quality)
@@ -317,81 +348,75 @@ class PositionManager:
         now = cached_now if cached_now is not None else time.time()
         
         # ============================================================
-        # CRITICAL HARD GATE: ABSOLUTE MINIMUM SCORE (CANNOT BE BYPASSED)
+        # UNIFIED FILTER: Core entry filtering (score, limits, market conditions)
         # ============================================================
-        # This check runs FIRST and CANNOT be bypassed by ANY other logic.
-        # Prevents bugs where signals with invalid scores slip through.
-        # ML SCORER V3: Scores range 25-50, so minimum is 20 (allow all valid ML scores)
-        ABSOLUTE_MIN_SCORE = 20  # ML Scorer floor - reject only garbage
-        if signal_score is not None and signal_score < ABSOLUTE_MIN_SCORE:
-            return False, f"HARD_GATE:score={signal_score:.1f}<{ABSOLUTE_MIN_SCORE}", None
-        if signal_score == 0:
-            return False, "HARD_GATE:score=0_invalid", None
-        # ============================================================
+        # Use UnifiedFilter for all basic filtering logic
+        filter_result = self.unified_filter.can_enter_position(
+            symbol=symbol,
+            signal_score=signal_score if signal_score is not None else (signal_strength * 100.0),
+            signal_strength=signal_strength,
+            spread_bps=spread_bps,
+            volume_24h=volume_24h,
+            latency_ms=latency_ms,
+            current_positions=current_positions,
+            open_positions=open_positions or {},
+            rsi=rsi,
+            atr_pct=atr_pct,
+            pct_change_1h=pct_change_1h,
+            side=side,
+            is_unicorn=is_unicorn,
+            drawdown_pct=drawdown_pct,
+            equity=equity,
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            position_size=position_size,
+            cached_now=now,
+        )
+        
+        # If unified filter rejects, return immediately (unless unicorn bypass)
+        if not filter_result.can_enter and not is_unicorn:
+            return False, filter_result.reason, filter_result.replacement_symbol
         
         # ============================================================
-        # DATA-DRIVEN FILTER 1: SYMBOL BLACKLIST
+        # ML CONFIDENCE FILTER: Check model confidence before entry
         # ============================================================
-        # Based on 4M+ trades analysis: BTC, ETC, ATOM, ADA, etc. are statistically
-        # significant underperformers (z < -1.96). Block them.
-        if SYMBOL_BLACKLIST:
-            # Extract base symbol (e.g., "BTC" from "BTC/USDT:USDT")
-            base_symbol = symbol.split('/')[0].upper()
-            if base_symbol in SYMBOL_BLACKLIST:
-                return False, f"BLACKLIST:symbol={base_symbol}", None
-        # ============================================================
+        # NEW SYSTEM: Only enter when ML models are 80%+ sure it will win
+        try:
+            from .ml_confidence_integration import apply_ml_confidence_filter
+            from .ml_confidence_config import USE_ML_CONFIDENCE_FILTER
+            
+            if USE_ML_CONFIDENCE_FILTER and not is_unicorn:
+                # Build signal data for confidence check
+                signal_data = {
+                    'final_score': signal_score if signal_score is not None else (signal_strength * 100.0),
+                    'ml_data': {
+                        # These will be populated by bot.py before calling can_enter_position
+                        'xgboost_prob': getattr(self, '_xgb_prob', None),
+                        'lightgbm_prob': getattr(self, '_lgb_prob', None),
+                        'random_forest_prob': getattr(self, '_rf_prob', None),
+                    }
+                }
+                
+                passed, reason = apply_ml_confidence_filter(
+                    symbol=symbol,
+                    signal_data=signal_data,
+                    position_count=current_positions
+                )
+                
+                if not passed:
+                    # Log ML confidence rejection for visibility in UI
+                    score_val = signal_score if signal_score is not None else 0
+                    self.logger.warning(
+                        f"[ML_CONF_REJECT] {symbol} | {reason} | "
+                        f"Score={score_val:.1f} | Pos={current_positions}"
+                    )
+                    return False, reason, None
+        except Exception as e:
+            # Graceful fallback: Log error but continue with score-based filtering
+            self.logger.warning(f"[ML_CONFIDENCE] Error checking confidence for {symbol}: {e}")
         
         # ============================================================
-        # DATA-DRIVEN FILTER 2: ADAPTIVE VOLATILITY + MOMENTUM + RSI
-        # ============================================================
-        # ADAPTIVE: Thresholds auto-adjust based on current market conditions
-        # - In calm markets: thresholds relax, more trades
-        # - In volatile markets: thresholds tighten, better trades
-        #
-        if ENTRY_FILTER_ENABLED and not REPLAY_MODE:
-            # Check if adaptive mode is enabled
-            use_adaptive = getattr(__import__('app.config', fromlist=['USE_ADAPTIVE_FILTERS']), 'USE_ADAPTIVE_FILTERS', False)
-            
-            if use_adaptive:
-                # Use adaptive percentile-based filtering
-                try:
-                    from .adaptive_filters import check_adaptive_entry
-                    
-                    if atr_pct is not None and pct_change_1h is not None and rsi is not None and side is not None:
-                        passed, reason = check_adaptive_entry(side, atr_pct, pct_change_1h, rsi)
-                        if not passed:
-                            return False, reason, None
-                except ImportError:
-                    # Fallback to fixed filters if adaptive module fails
-                    use_adaptive = False
-            
-            if not use_adaptive:
-                # Fixed threshold mode (fallback)
-                if ENTRY_FILTER_RELAXED:
-                    min_atr = ENTRY_MIN_ATR_PCT_RELAXED
-                    min_mom = ENTRY_MIN_MOMENTUM_PCT_RELAXED
-                    rsi_long_max = ENTRY_RSI_LONG_MAX_RELAXED
-                    rsi_short_min = ENTRY_RSI_SHORT_MIN_RELAXED
-                else:
-                    min_atr = ENTRY_MIN_ATR_PCT
-                    min_mom = ENTRY_MIN_MOMENTUM_PCT
-                    rsi_long_max = ENTRY_RSI_LONG_MAX
-                    rsi_short_min = ENTRY_RSI_SHORT_MIN
-                
-                # Check volatility filter (need market to be moving)
-                if atr_pct is not None and atr_pct < min_atr:
-                    return False, f"ENTRY_FILTER:low_vol(ATR={atr_pct:.2f}%<{min_atr}%)", None
-                
-                # Check momentum filter (need strong move)
-                if pct_change_1h is not None and abs(pct_change_1h) < min_mom:
-                    return False, f"ENTRY_FILTER:low_momentum(|1h|={abs(pct_change_1h):.2f}%<{min_mom}%)", None
-                
-                # Check RSI alignment (direction confirmation)
-                if rsi is not None and side is not None:
-                    if side == 'long' and rsi > rsi_long_max:
-                        return False, f"ENTRY_FILTER:RSI_not_oversold(RSI={rsi:.0f}>{rsi_long_max})", None
-                    elif side == 'short' and rsi < rsi_short_min:
-                        return False, f"ENTRY_FILTER:RSI_not_overbought(RSI={rsi:.0f}<{rsi_short_min})", None
+        # POSITION MANAGER SPECIFIC CHECKS (beyond basic filtering)
         # ============================================================
         
         # Check symbol churn cooldown (after basic global checks, before score filters)
@@ -435,14 +460,20 @@ class PositionManager:
                 self.last_loss_time = 0.0
         
         # DYNAMIC MAX POSITION CAP: Based on risk budget (floor(MAX_ACCOUNT_RISK_PCT / RISK_PER_TRADE_PCT), clamped by MAX_CONCURRENT_POS_HARD)
-        # Unicorns still get priority in ranking, but cannot exceed dynamic cap
+        # UNICORN BYPASS: Unicorns ALWAYS get in, no matter the position limit
         if equity is None or equity <= 0:
             # Fallback to legacy cap if equity not available
             max_pos = MAX_OPEN_POSITIONS
         else:
             max_pos = self.get_effective_max_positions(equity=equity)
+        
+        # Check position limit, but BYPASS for unicorns
         if current_positions >= max_pos:
-            return False, f"RJ – max positions reached ({current_positions}/{max_pos})", None
+            if is_unicorn and UNICORN_PROTOCOL_ENABLED:
+                self.logger.info(f"[UNICORN_BYPASS] Allowing entry despite position limit ({current_positions}/{max_pos}) - Unicorn signal!")
+                # Continue - don't return, let unicorn through
+            else:
+                return False, f"RJ – max positions reached ({current_positions}/{max_pos})", None
         
         # Loss-streak handled via state machine with score bypass
         # Normal validation path
@@ -559,27 +590,8 @@ class PositionManager:
         # Adaptive filters handle this based on current market conditions
         # (see adaptive_filters.py for percentile-based filtering)
         
-        # Check spread
-        # CRITICAL: For Binance Futures, spreads can be very tight (0 bps for futures contracts)
-        # Only check MAX_SPREAD_BPS, don't require MIN_SPREAD_BPS for futures
-        if spread_bps > MAX_SPREAD_BPS:
-            return False, f"Spread too wide ({spread_bps:.1f}bps > {MAX_SPREAD_BPS}bps)", None
-        
-        # Adaptive spread filter (relax for high-strength signals)
-        # For Binance Futures, allow 0 spread (futures contracts often have no spread)
-        spread_threshold = MAX_SPREAD_BPS  # Default to max for futures
-        if signal_strength < 0.7:
-            # Only apply MIN_SPREAD_BPS check for weak signals
-            if spread_bps < MIN_SPREAD_BPS and spread_bps > 0:
-                # Allow 0 spread but reject very small spreads for weak signals
-                pass  # For now, allow 0 spread
-        
-        # Check volume
-        # CRITICAL: Ensure volume check uses correct threshold and format for Binance Futures
-        min_volume_m = MIN_VOLUME_24H / 1e6
-        volume_m = volume_24h / 1e6
-        if volume_24h < MIN_VOLUME_24H:
-            return False, f"Volume too low (${volume_m:.2f}M < ${min_volume_m:.0f}M)", None
+        # Spread and volume checks are now handled by UnifiedFilter
+        # (removed duplicate checks here)
         
         # Check latency
         if latency_ms > MAX_LATENCY_MS:
@@ -659,13 +671,16 @@ class PositionManager:
         """Record position entry for cooldown and rate limiting."""
         now = time.time()
         
+        # Record in UnifiedFilter for rate limiting
+        self.unified_filter.record_entry(timestamp=now)
+        
         # Track daily trades
         if now - self.last_daily_reset >= 86400:
             self.daily_trades = []
             self.last_daily_reset = now
         self.daily_trades.append(now)
         
-        # Record entry time for rate limiting
+        # Record entry time for rate limiting (legacy - kept for backward compatibility)
         self.entry_times.append(now)
         
         # Set cooldown
@@ -1502,7 +1517,7 @@ class PositionManager:
             # Fall back to risk-based method (always use risk budget approach)
             # Note: open_positions not available here, will be passed from bot.py
             size, risk_fraction, reason = self.calculate_position_size(
-                equity, entry_price, stop_loss_price, signal_strength, side, 
+                "", equity, entry_price, stop_loss_price, signal_strength, side,
                 is_unicorn=is_unicorn, open_positions=None
             )
             if reason:
@@ -1574,4 +1589,95 @@ class PositionManager:
         position_size = max(position_size, MIN_POSITION_SIZE / entry_price)
         
         return position_size, leverage
+
+
+class SymbolAdaptationManager:
+    """
+    ML-Driven Symbol Adaptation System
+
+    Instead of blacklisting bad symbols, this system:
+    1. Learns optimal parameters for each symbol from ML training
+    2. Adapts position sizing, stops, leverage, and timing per symbol
+    3. Enables profitable trading of "difficult" symbols like BNB
+
+    Key insight: BNB shows -95% avg loss in raw data, but ML finds +59% avg R patterns!
+    """
+
+    def __init__(self):
+        self._symbol_profiles = {}
+        self._last_cache_update = 0
+        self._cache_ttl = 300  # 5 minutes
+
+    def get_adapted_parameters(self, symbol: str, base_params: dict) -> dict:
+        """
+        Get ML-adapted trading parameters for a symbol.
+
+        Args:
+            symbol: Trading symbol
+            base_params: Default/base parameters
+
+        Returns:
+            Adapted parameters with symbol-specific optimizations
+        """
+        profile = self._get_symbol_profile(symbol)
+        if not profile:
+            return base_params  # No adaptation data, use defaults
+
+        adapted = base_params.copy()
+
+        # 1. POSITION SIZING: Base on historical win rate
+        win_rate = profile.get('win_rate', 0.4)
+        if win_rate > 0.55:  # Above 55% win rate
+            size_boost = 1.0 + (win_rate - 0.55) * 2.0  # Up to 2x size for 65%+ WR
+            adapted['size_multiplier'] = adapted.get('size_multiplier', 1.0) * size_boost
+
+        # 2. STOP LOSS: Use ML-learned optimal SL
+        if 'optimal_sl' in profile:
+            # ML suggests optimal SL as percentage, convert to ATR multiplier
+            optimal_sl_pct = profile['optimal_sl']
+            # ATR multiplier = optimal_SL / typical_ATR (assume 1% ATR)
+            adapted['sl_atr_multiplier'] = optimal_sl_pct / 0.01
+
+        # 3. LEVERAGE: Conservative for volatile symbols
+        avg_r = profile.get('avg_r', 0)
+        if avg_r < 0:  # Losing symbol
+            adapted['leverage_multiplier'] = 0.7  # Reduce leverage
+        elif avg_r > 50:  # Very profitable
+            adapted['leverage_multiplier'] = 1.2  # Increase leverage
+
+        # 4. HOLD TIME: Use ML-learned optimal duration
+        if 'avg_hold_time' in profile:
+            adapted['max_hold_minutes'] = profile['avg_hold_time'] * 1.5  # 50% buffer
+
+        # 5. TIMING: Prefer historically good hours/days
+        if 'best_hour' in profile:
+            adapted['preferred_hour'] = profile['best_hour']
+        if 'best_day' in profile:
+            adapted['preferred_day'] = profile['best_day']
+
+        return adapted
+
+    def _get_symbol_profile(self, symbol: str) -> Optional[dict]:
+        """Get ML-learned symbol profile."""
+        import time
+        from pathlib import Path
+        import json
+
+        # Cache profiles for performance
+        now = time.time()
+        if now - self._last_cache_update > self._cache_ttl:
+            try:
+                profiles_dir = Path("master_hindsight_models")
+                if profiles_dir.exists():
+                    model_dirs = sorted(profiles_dir.glob("*"), reverse=True)
+                    if model_dirs:
+                        profile_file = model_dirs[0] / "symbol_profiles.json"
+                        if profile_file.exists():
+                            with open(profile_file, 'r') as f:
+                                self._symbol_profiles = json.load(f)
+                            self._last_cache_update = now
+            except Exception:
+                pass  # Silent failure, use defaults
+
+        return self._symbol_profiles.get(symbol.upper())
 

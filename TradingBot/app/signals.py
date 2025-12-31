@@ -13,22 +13,25 @@ from .config import (
     SIGNAL_PERCENTILE_THRESHOLD, SIGNAL_HISTORY_SIZE,
     DYNAMIC_THRESHOLDS_ENABLED, THRESHOLD_ADJUSTMENT_WINDOW, THRESHOLD_ADJUSTMENT_STEP,
     WIN_RATE_RELAX_THRESHOLD, WIN_RATE_TIGHTEN_THRESHOLD, MIN_SCORE_RANGE, MIN_STRENGTH_RANGE,
-    DRY_RUN, REPLAY_MODE, USE_SIGNAL_PERCENTILE_FILTER,
-    MVP_SCORING_MODE, SCORING_ROLLBACK, MVP_BANDIT_ENABLED,
+    REPLAY_MODE, USE_SIGNAL_PERCENTILE_FILTER,
     # Data-driven filters
     MIN_ATR_PCT,
+    # Phase 2 patterns
+    PHASE2_ENABLED,
 )
+# Adaptive threshold system
+try:
+    from .config import USE_ADAPTIVE_THRESHOLDS
+except ImportError:
+    USE_ADAPTIVE_THRESHOLDS = False
 # LONG BIAS: Import bonus for MAJOR coin longs
 try:
     from .config import LONG_MAJOR_SCORE_BONUS
 except ImportError:
     LONG_MAJOR_SCORE_BONUS = 0.0  # Default: no bonus
 
-# ML SCORING: Replaced FreshnessScorer (r=0.0044 correlation) with trained LightGBM model
-# Trained on 4M+ trades, achieves AUC 0.5246 with +6% lift in top decile win rate
-from .ml_scorer import MLScorer
-# Keep FreshnessScorer as fallback import (MLScorer has internal fallback)
-from .freshness_scorer import FreshnessScorer  # Legacy - used as fallback in MLScorer
+# UNIFIED ML FRAMEWORK: Single source of truth for all ML operations
+from .ml.unified_framework import get_unified_ml_framework
 
 
 @dataclass(slots=True)
@@ -51,14 +54,6 @@ class TradingSignal:
     score_components_raw: Optional[Dict] = None  # Freshness score components
     score_components_capped: Optional[Dict] = None  # Freshness score components
 
-    # MVP scoring (shadow/live behind rollback switch)
-    mvp_mode: Optional[str] = None
-    mvp_score: Optional[float] = None
-    mvp_components: Optional[Dict] = None
-    mvp_arm: Optional[str] = None
-    mvp_effective_min_score: Optional[float] = None
-    mvp_effective_min_strength: Optional[float] = None
-    mvp_would_enter: Optional[bool] = None
     
     def __post_init__(self):
         if self.timestamp is None:
@@ -73,10 +68,10 @@ class SignalGenerator:
     
     def __init__(self):
         self.signal_history = []
-        # ML SCORING: Trained LightGBM model replaces FreshnessScorer
-        # Model trained on 4M+ trades with ~6% win rate lift in top decile
-        self.ml_scorer = MLScorer()
-        # Keep reference as freshness_scorer for backward compatibility
+        # UNIFIED ML FRAMEWORK: Single source of truth for ML operations
+        self.ml_framework = get_unified_ml_framework()
+        self.ml_scorer = self.ml_framework.get_signal_scorer()
+        # Backward compatibility alias (deprecated - use ml_scorer directly)
         self.freshness_scorer = self.ml_scorer
         # OPTIMIZATION: Cache percentile threshold to avoid recalculating
         self._cached_threshold = None
@@ -91,10 +86,6 @@ class SignalGenerator:
         self._cached_trades_hash = None  # Hash of recent trades for cache invalidation
         self._cached_regime = None
         self._cached_btc_trend = None
-        
-        # MARKSMAN removed - no longer used
-        # MVP scoring engine (lazy)
-        self._mvp_engine = None
     
     @staticmethod
     def _get_thresholds():
@@ -457,17 +448,9 @@ class SignalGenerator:
             # Detailed error logging for debugging
             return None, f"Invalid price data for {symbol}: bid={bid:.8f}, ask={ask:.8f}, last={last:.8f}"
         
-        # ============================================================
-        # DATA-DRIVEN FILTER: MINIMUM ATR (Skip Low Volatility)
-        # ============================================================
-        # Analysis of 4M+ trades shows 56.5% SL rate when ATR < 0.5% vs 30.2% when ATR > 2%
-        # Low volatility = SL too tight relative to noise = more stop-outs
-        if indicators and MIN_ATR_PCT > 0:
-            atr_pct = indicators.get('atr_pct', 0)
-            if atr_pct > 0 and atr_pct < MIN_ATR_PCT:
-                self._filter_stats['rejected_low_atr'] = self._filter_stats.get('rejected_low_atr', 0) + 1
-                return None, f"LOW_ATR:atr={atr_pct*100:.2f}%<{MIN_ATR_PCT*100:.1f}%"
-        # ============================================================
+        # ATR filter REMOVED: ML model already considers ATR as a feature
+        # The ML was trained on millions of trades and knows when ATR is too low
+        # Hardcoded filters override ML predictions - let the model decide!
         
         # ENTRY PRICE:
         # - If caller provides an explicit entry_price, trust it (used by some diagnostics/tests).
@@ -507,12 +490,147 @@ class SignalGenerator:
         if mean_reversion_signal:
             signals.append(mean_reversion_signal)
         
+        # COMPLEMENTARY SIGNAL LOGIC: Make momentum and mean reversion work together
+        # Priority: Momentum > Mean Reversion when signals conflict
+        if len(signals) == 2:  # Both momentum and mean reversion signals present
+            momentum_sig = next((s for s in signals if s.signal_type == "momentum"), None)
+            mr_sig = next((s for s in signals if s.signal_type == "mean_reversion"), None)
+
+            if momentum_sig and mr_sig:
+                # Check for conflicts (opposite directions)
+                if momentum_sig.side != mr_sig.side:
+                    # Signals conflict - prefer momentum (trend continuation > temporary extremes)
+                    # Only keep momentum if it's strong enough (>60% of max strength)
+                    if momentum_sig.strength >= 0.6:
+                        signals = [momentum_sig]  # Keep only momentum
+                        # Boost strength slightly for clean momentum signal
+                        momentum_sig.strength = min(1.0, momentum_sig.strength * 1.1)
+                    else:
+                        # Weak momentum - remove both conflicting signals
+                        signals = []
+                else:
+                    # Same direction - complementary, keep both but prefer stronger one
+                    # Add small boost for alignment
+                    momentum_sig.strength = min(1.0, momentum_sig.strength * 1.05)
+                    mr_sig.strength = min(1.0, mr_sig.strength * 1.05)
+
         # Select best signal
         if not signals:
-            return None, "No signals generated (no momentum/mean_reversion signals)"
-        
+            return None, "No signals generated (conflicting momentum/MR signals filtered)"
+
         # Sort by strength and take the best
         best_signal = max(signals, key=lambda s: s.strength)
+
+        # ENTRY PRICE OPTIMIZATION: Signal-type aware pricing
+        # Momentum signals: Aggressive entry (catch the move)
+        # Mean reversion signals: Conservative entry (wait for better price)
+        original_entry = best_signal.entry_price
+
+        if best_signal.signal_type == "momentum":
+            # Momentum signals need speed - enter more aggressively
+            if best_signal.side == "long":
+                # Long momentum: Enter slightly above bid to catch upward momentum
+                best_signal.entry_price = bid * 1.0005  # 0.05% above bid
+            else:  # short
+                # Short momentum: Enter slightly below ask to catch downward momentum
+                best_signal.entry_price = ask * 0.9995  # 0.05% below ask
+        elif best_signal.signal_type == "mean_reversion":
+            # Mean reversion signals can be patient - use standard mid-price
+            # No change needed, already at mid-price
+            pass
+
+        # Validate entry price is still reasonable (not too far from mid)
+        mid_price = (bid + ask) / 2
+        price_deviation = abs(best_signal.entry_price - mid_price) / mid_price
+        if price_deviation > 0.005:  # More than 0.5% deviation
+            best_signal.entry_price = mid_price  # Revert to mid-price
+
+        # ============================================================================
+        # NEW INDICATOR ENHANCEMENTS - Better Entry/Exit Performance
+        # ============================================================================
+        from . import indicators as ind_module
+        
+        strength_boost = 0.0
+        strength_penalty = 0.0
+        boost_reason = ""
+        
+        try:
+            # Get price data for new indicators
+            if price_data and price_data.get('candles'):
+                candles = price_data['candles']
+                if len(candles) >= 20:
+                    closes = [c[4] for c in candles]  # [o, h, l, c, v]
+                    highs = [c[2] for c in candles]
+                    lows = [c[3] for c in candles]
+                    volumes = [c[5] for c in candles] if candles and len(candles[0]) > 5 else [1] * len(candles)
+                    
+                    # 1. MACD confirmation
+                    macd = ind_module.calculate_macd(closes)
+                    if macd:
+                        if best_signal.side == 'long' and macd['histogram'] > 0:
+                            strength_boost += 0.08
+                            boost_reason += "[MACD-UP] "
+                        elif best_signal.side == 'short' and macd['histogram'] < 0:
+                            strength_boost += 0.08
+                            boost_reason += "[MACD-DOWN] "
+                        else:
+                            strength_penalty += 0.05
+                    
+                    # 2. Stochastic RSI extremes
+                    stoch_rsi = ind_module.calculate_stochastic_rsi(closes)
+                    if stoch_rsi:
+                        if best_signal.side == 'long' and stoch_rsi['K'] > 70:
+                            strength_penalty += 0.10  # Overbought - avoid
+                        elif best_signal.side == 'short' and stoch_rsi['K'] < 30:
+                            strength_penalty += 0.10  # Oversold - avoid on short
+                        elif best_signal.side == 'long' and stoch_rsi['K'] < 30:
+                            strength_boost += 0.07  # Oversold - good for long
+                            boost_reason += "[STOCH-OSold] "
+                        elif best_signal.side == 'short' and stoch_rsi['K'] > 70:
+                            strength_boost += 0.07  # Overbought - good for short
+                            boost_reason += "[STOCH-OBought] "
+                    
+                    # 3. Bollinger Bands - entry at bands
+                    bb = ind_module.calculate_bollinger_bands(closes)
+                    if bb:
+                        price_pct = (closes[-1] - bb['lower']) / (bb['upper'] - bb['lower']) if bb['width'] > 0 else 0.5
+                        if best_signal.side == 'long' and price_pct < 0.2:
+                            strength_boost += 0.06  # Price near lower band
+                            boost_reason += "[BB-Lower] "
+                        elif best_signal.side == 'short' and price_pct > 0.8:
+                            strength_boost += 0.06  # Price near upper band
+                            boost_reason += "[BB-Upper] "
+                    
+                    # 4. Volume confirmation
+                    vol_conf = ind_module.calculate_volume_confirmation(volumes, closes)
+                    if vol_conf is not None:
+                        if vol_conf > 0.7:
+                            strength_boost += 0.06
+                            boost_reason += "[Vol-Strong] "
+                        elif vol_conf < 0.4:
+                            strength_penalty += 0.05
+                    
+                    # 5. RSI Divergence - EXIT signal
+                    divergence = ind_module.detect_rsi_divergence(closes, highs, lows)
+                    if divergence:
+                        if divergence == 'bearish_div' and best_signal.side == 'long':
+                            strength_penalty += 0.15  # Don't enter long on bearish div
+                        elif divergence == 'bullish_div' and best_signal.side == 'short':
+                            strength_penalty += 0.15  # Don't enter short on bullish div
+        
+        except Exception as e:
+            logger.debug(f"Error applying new indicators for {symbol}: {e}")
+        
+        # Apply boosts/penalties to signal strength
+        original_strength = best_signal.strength
+        best_signal.strength = max(0.0, min(1.0, best_signal.strength + strength_boost - strength_penalty))
+        
+        if abs(strength_boost) > 0.01 or abs(strength_penalty) > 0.01:
+            logger.debug(
+                f"[INDICATORS] {symbol}: {original_strength:.3f} + {strength_boost:+.3f} - {strength_penalty:.3f} = {best_signal.strength:.3f} {boost_reason}"
+            )
+        
+        # ============================================================================
         
         # MARKET BIAS: DISABLED (Holy Grail config - backtested without these filters)
         # These filters were causing trade blocking. Backtested results achieved
@@ -553,10 +671,12 @@ class SignalGenerator:
         spread_bps = float(raw_spread) if raw_spread is not None else 0.0
         
         # ================================================================
-        # ML SCORING - XGBoost is now the PRIMARY scorer
+        # ML SCORING - Using HybridMLScorer (Ensemble) via Unified Framework
+        # Falls back to XGBoost automatically if hybrid unavailable
         # ================================================================
-        from .ml_scorer import get_ml_scorer
-        ml_scorer = get_ml_scorer()
+        
+        # Use the unified framework's signal scorer (hybrid if available, XGBoost fallback)
+        ml_scorer = self.ml_scorer  # Already initialized in __init__
         
         final_score, score_components = ml_scorer.score_signal(
             symbol=symbol,
@@ -566,12 +686,14 @@ class SignalGenerator:
             orderbook=orderbook,
             indicators=indicators,
             latency_ms=latency_ms,
+            side=best_signal.side,  # Pass side for ML prediction accuracy
         )
         
-        # Store ML info for debugging
-        best_signal.mvp_mode = "ml_xgb"
-        best_signal.mvp_score = final_score
-        best_signal.mvp_components = score_components
+        # DEBUG: Log ML scoring details with full component dump
+        from .logger import get_logger
+        logger = get_logger("SignalGenerator")
+        if final_score < 45:  # Only log rejected scores to reduce spam
+            logger.warning(f"[ML_SCORE_DEBUG] {symbol} {best_signal.side}: score={final_score:.2f}, components={score_components}")
         
         # Store score in signal
         best_signal.final_score = final_score
@@ -590,6 +712,93 @@ class SignalGenerator:
             if is_major and is_long:
                 best_signal.final_score = final_score + LONG_MAJOR_SCORE_BONUS
                 score_components['long_major_bonus'] = LONG_MAJOR_SCORE_BONUS
+
+        # HOUR-WEIGHTED SCORING: ML-learned optimal trading hours
+        # Boost scores during symbol's historically best hours, penalize worst hours
+        try:
+            from pathlib import Path
+            import json
+            from datetime import datetime
+
+            # Get current UTC hour
+            current_hour = datetime.utcnow().hour
+
+            # Load symbol profile
+            profiles_dir = Path("master_hindsight_models")
+            if profiles_dir.exists():
+                model_dirs = sorted(profiles_dir.glob("*"), reverse=True)
+                if model_dirs:
+                    profile_file = model_dirs[0] / "symbol_profiles.json"
+                    if profile_file.exists():
+                        with open(profile_file, 'r') as f:
+                            symbol_profiles = json.load(f)
+
+                        symbol_upper = symbol.split('/')[0].upper()
+                        if symbol_upper in symbol_profiles:
+                            profile = symbol_profiles[symbol_upper]
+                            best_hour = profile.get('best_hour')
+
+                            if best_hour is not None:
+                                hour_diff = abs(current_hour - best_hour)
+                                max_hour_diff = 12  # 12 hours = half day
+
+                                if hour_diff <= 2:  # Within 2 hours of best hour
+                                    # Boost score by 10% (max +10 points)
+                                    hour_bonus = min(10.0, final_score * 0.1)
+                                    best_signal.final_score = final_score + hour_bonus
+                                    score_components['hour_bonus'] = hour_bonus
+                                elif hour_diff >= 8:  # 8+ hours from best hour
+                                    # Penalize score by 5% (max -5 points)
+                                    hour_penalty = min(5.0, final_score * 0.05)
+                                    best_signal.final_score = final_score - hour_penalty
+                                    score_components['hour_penalty'] = -hour_penalty
+
+                            # SYMBOL CHARACTER LEARNING: Adjust for RSI deviation from average
+                            # Penalize signals when RSI is far from symbol's historical average
+                            avg_rsi = profile.get('avg_rsi')
+                            if avg_rsi is not None and indicators and 'rsi' in indicators:
+                                current_rsi = indicators['rsi']
+                                rsi_deviation = abs(current_rsi - avg_rsi)
+
+                                if rsi_deviation > 15:  # RSI far from normal
+                                    rsi_penalty = min(8.0, rsi_deviation / 2)  # Up to 8 points penalty
+                                    best_signal.final_score = final_score - rsi_penalty
+                                    score_components['rsi_deviation_penalty'] = -rsi_penalty
+                                elif rsi_deviation < 5:  # RSI close to average
+                                    rsi_bonus = min(3.0, (5 - rsi_deviation) * 0.6)  # Up to 3 points bonus
+                                    best_signal.final_score = final_score + rsi_bonus
+                                    score_components['rsi_normal_bonus'] = rsi_bonus
+
+                            # VOLATILITY CHARACTER: Adjust for ATR deviation
+                            # Some symbols are naturally more/less volatile
+                            avg_atr = profile.get('avg_atr_pct')
+                            if avg_atr is not None and indicators and 'atr_pct' in indicators:
+                                current_atr = indicators['atr_pct']
+                                atr_ratio = current_atr / avg_atr if avg_atr > 0 else 1.0
+
+                                if atr_ratio > 1.5:  # Much more volatile than usual
+                                    vol_penalty = min(5.0, (atr_ratio - 1.5) * 2)
+                                    best_signal.final_score = final_score - vol_penalty
+                                    score_components['high_vol_penalty'] = -vol_penalty
+                                elif atr_ratio < 0.7:  # Much less volatile than usual
+                                    vol_bonus = min(3.0, (0.7 - atr_ratio) * 4)
+                                    best_signal.final_score = final_score + vol_bonus
+                                    score_components['low_vol_bonus'] = vol_bonus
+
+                            # WIN RATE CHARACTER: Conservative boost for high-winrate symbols
+                            win_rate = profile.get('win_rate', 0.0)
+                            if win_rate > 0.6:  # >60% win rate historically
+                                winrate_bonus = min(5.0, (win_rate - 0.6) * 10)  # Up to 5 points
+                                best_signal.final_score = final_score + winrate_bonus
+                                score_components['winrate_bonus'] = winrate_bonus
+                            elif win_rate < 0.4:  # <40% win rate historically
+                                winrate_penalty = min(8.0, (0.4 - win_rate) * 15)  # Up to 8 points
+                                best_signal.final_score = final_score - winrate_penalty
+                                score_components['winrate_penalty'] = -winrate_penalty
+
+        except Exception as e:
+            # Silent failure - don't break signal generation
+            pass
         
         # Update signal strength to match score (for backward compatibility)
         # Map 0-100 score to 0-1 strength
@@ -620,6 +829,9 @@ class SignalGenerator:
         # Apply explicit overrides if provided (Dynamic Regime Switching)
         if min_score_override is not None:
             min_score = float(min_score_override)
+        elif USE_ADAPTIVE_THRESHOLDS and hasattr(self, 'adaptive_threshold_manager'):
+            # ADAPTIVE THRESHOLD: Automatically adjusts based on market conditions
+            min_score = self.adaptive_threshold_manager.get_adaptive_threshold(self.signal_history)
         elif DYNAMIC_THRESHOLDS_ENABLED:
             min_score = dynamic_score
         else:
@@ -633,34 +845,6 @@ class SignalGenerator:
         else:
             min_strength = thresholds['min_strength']
 
-        # MVP scoring policy observability: compute what the selected profile would do,
-        # but do not change trading decisions unless MVP_SCORING_MODE == "live" later.
-        if (not SCORING_ROLLBACK) and str(MVP_SCORING_MODE).lower() in ("shadow", "live"):
-            try:
-                import os
-                from .scoring_mvp.profiles import PROFILES
-                from .scoring_mvp.engine import apply_profile_thresholds
-
-                # Manual arm override for now (bandit wiring comes next).
-                arm_id = str(os.environ.get("MVP_ARM", "balanced")).strip().lower()
-                prof = PROFILES.get(arm_id) or PROFILES.get("balanced")
-                if prof:
-                    eff_min_score, eff_min_strength = apply_profile_thresholds(
-                        base_min_score=float(min_score),
-                        base_min_strength=float(min_strength),
-                        profile_min_score_delta=float(prof.min_score_delta),
-                        profile_min_strength_delta=float(prof.min_strength_delta),
-                    )
-                    best_signal.mvp_arm = best_signal.mvp_arm or prof.arm_id
-                    best_signal.mvp_effective_min_score = eff_min_score
-                    best_signal.mvp_effective_min_strength = eff_min_strength
-                    best_signal.mvp_would_enter = (
-                        float(best_signal.final_score) >= float(eff_min_score)
-                        and float(best_signal.strength) >= float(eff_min_strength)
-                    )
-            except Exception:
-                pass
-            
         # Hard Min Score: must be explicitly below min_score.
         hard_min_cfg = float(thresholds.get('hard_min_score', (float(min_score) - 5.0)))
         hard_min = min(hard_min_cfg, float(min_score) - 1.0)
@@ -744,7 +928,10 @@ class SignalGenerator:
         # Log signal with score breakdown
         from .logger import get_logger
         logger = get_logger("SignalGenerator")
-        score_breakdown = self.freshness_scorer.get_score_breakdown_str(score_components)
+        try:
+            score_breakdown = self.ml_scorer.get_score_breakdown_str(score_components)
+        except Exception:
+            score_breakdown = f"ML_score={best_signal.final_score:.1f}"
         logger.info(
             f"[SIGNAL] {symbol} {best_signal.side.upper()} | "
             f"Score={best_signal.final_score:.1f} ({score_breakdown}) | "
@@ -828,6 +1015,93 @@ class SignalGenerator:
         # Momentum is primary factor, volume provides liquidity boost
         strength = (momentum_strength * 0.75) + (volume_factor * 0.25)
         
+        # CANDLE ANALYSIS: Boost/penalize strength based on local structure
+        # This is optional - only applies if candles are available
+        if price_data and price_data.get('candles'):
+            try:
+                from .candle_analyzer import CandleAnalyzer
+                side_for_analysis = "long" if pct_change > 0 else "short"
+                candle_analysis = CandleAnalyzer.analyze_local_structure(price_data['candles'])
+                candle_boost, candle_reason = CandleAnalyzer.calculate_entry_boost(
+                    candle_analysis, 
+                    side_for_analysis
+                )
+                original_strength = strength
+                strength = max(0.0, min(1.0, strength + candle_boost))  # Clamp to 0-1
+                if abs(candle_boost) > 0.01:  # Only log if meaningful change
+                    from .logger import get_logger
+                    logger = get_logger("SignalGenerator")
+                    logger.debug(
+                        f"[CANDLE] {symbol}: {original_strength:.3f} + {candle_boost:+.3f} "
+                        f"({candle_reason}) = {strength:.3f}"
+                    )
+            except Exception as e:
+                from .logger import get_logger
+                logger = get_logger("SignalGenerator")
+                logger.debug(f"[CANDLE_ERROR] {symbol}: {e}")
+                pass  # Continue with original strength if analysis fails
+        
+        # PHASE 2: ADVANCED PATTERN RECOGNITION (Optional enhancement)
+        # Detects specific candlestick patterns for higher confidence entries
+        if PHASE2_ENABLED and price_data and price_data.get('candles'):
+            try:
+                from .candle_analyzer import CandleAnalyzer
+                side_for_patterns = "long" if pct_change > 0 else "short"
+                
+                # Get pattern boost (hammer, engulfing, doji, pin bar)
+                pattern_boost, pattern_reason = CandleAnalyzer.calculate_pattern_boost(
+                    price_data['candles'],
+                    side_for_patterns
+                )
+                
+                # Apply pattern boost on top of Phase 1
+                original_strength_p2 = strength
+                strength = max(0.0, min(1.0, strength + pattern_boost))  # Clamp to 0-1
+                
+                if abs(pattern_boost) > 0.01:  # Only log if meaningful change
+                    from .logger import get_logger
+                    logger = get_logger("SignalGenerator")
+                    logger.info(
+                        f"[CANDLE_PHASE2] {symbol}: {original_strength_p2:.3f} + {pattern_boost:+.3f} "
+                        f"({pattern_reason}) = {strength:.3f}"
+                    )
+            except Exception as e:
+                from .logger import get_logger
+                logger = get_logger("SignalGenerator")
+                logger.debug(f"[CANDLE_PHASE2_ERROR] {symbol}: {e}")
+                pass  # Continue with Phase 1 strength if Phase 2 fails
+        
+        # PHASE 3: MEAN REVERSION SPECIFIC PATTERNS (Optional enhancement)
+        # Detects rejection zones and bounce confirmations for mean reversion entries
+        from .config import PHASE3_ENABLED
+        if PHASE3_ENABLED and price_data and price_data.get('candles'):
+            try:
+                from .candle_analyzer import CandleAnalyzer
+                side_for_phase3 = "long" if pct_change > 0 else "short"
+                
+                # Get Phase 3 boost (rejection zones, bounce confirmation)
+                phase3_boost, phase3_reason = CandleAnalyzer.calculate_phase3_boost(
+                    price_data['candles'],
+                    side_for_phase3
+                )
+                
+                # Apply Phase 3 boost on top of Phase 1 + Phase 2
+                original_strength_p3 = strength
+                strength = max(0.0, min(1.0, strength + phase3_boost))  # Clamp to 0-1
+                
+                if abs(phase3_boost) > 0.01:  # Only log if meaningful change
+                    from .logger import get_logger
+                    logger = get_logger("SignalGenerator")
+                    logger.info(
+                        f"[CANDLE_PHASE3] {symbol}: {original_strength_p3:.3f} + {phase3_boost:+.3f} "
+                        f"({phase3_reason}) = {strength:.3f}"
+                    )
+            except Exception as e:
+                from .logger import get_logger
+                logger = get_logger("SignalGenerator")
+                logger.debug(f"[CANDLE_PHASE3_ERROR] {symbol}: {e}")
+                pass  # Continue with Phase 1+2 strength if Phase 3 fails
+        
         if strength < min_signal_strength:
             return None
         
@@ -842,9 +1116,66 @@ class SignalGenerator:
             # Estimate ATR from recent volatility (24h change is a rough proxy)
             atr_pct = max(abs(pct_change) / 10.0, 0.01)  # At least 1%
         
-        # Calculate SL/TP based on ATR and configurable multiplier
-        # SL = 1x ATR (configurable), TP = 3x SL for 3:1 R:R
-        stop_loss_pct = atr_pct * SL_ATR_MULTIPLIER
+        # TRY ML-BASED STOP LOSS PREDICTION (NEW!)
+        try:
+            from ml_sl_predictor import get_ml_sl_predictor
+            ml_sl = get_ml_sl_predictor()
+            
+            if ml_sl and ml_sl.enabled:
+                # Get regime and signal strength
+                regime = "NEUTRAL"  # Default
+                signal_strength = 50  # Default
+                
+                # Try to estimate regime from indicators
+                if indicators:
+                    rsi = indicators.get('rsi', 50)
+                    adx = indicators.get('adx', 20)
+                    
+                    # Simplified regime classification
+                    if adx > 25 and (rsi < 30 or rsi > 70):
+                        regime = "PROFITABLE"
+                    elif adx > 25:
+                        regime = "HIGH_PERFORMANCE"
+                    elif rsi < 25 or rsi > 75:
+                        regime = "NEUTRAL"
+                    else:
+                        regime = "DANGEROUS"
+                    
+                    signal_strength = adx  # Use ADX as proxy for signal strength
+                
+                # Predict optimal SL
+                ml_stop_loss_pct = ml_sl.predict(
+                    symbol=symbol,
+                    regime=regime,
+                    volatility_pct=atr_pct,
+                    signal_strength=signal_strength,
+                    side=side,
+                    rsi=indicators.get('rsi', 50) if indicators else 50,
+                    adx=indicators.get('adx', 20) if indicators else 20
+                )
+                
+                # Use ML prediction instead of ATR-based formula
+                stop_loss_pct = ml_stop_loss_pct
+                
+                from .logger import get_logger
+                logger = get_logger("SignalGenerator")
+                logger.debug(
+                    f"[ML_SL] {symbol} {side}: "
+                    f"ATR={atr_pct:.4f} → ML_SL={stop_loss_pct:.4f} "
+                    f"(regime={regime})"
+                )
+            else:
+                # Fallback to ATR-based if ML not available
+                stop_loss_pct = atr_pct * SL_ATR_MULTIPLIER
+        except Exception as e:
+            # Fallback to ATR-based if ML fails
+            stop_loss_pct = atr_pct * SL_ATR_MULTIPLIER
+            from .logger import get_logger
+            logger = get_logger("SignalGenerator")
+            logger.debug(f"[ML_SL] Failed, falling back to ATR: {e}")
+        
+        # Calculate SL/TP based on stop_loss_pct
+        # TP = 3x SL for 3:1 R:R
         take_profit_pct = stop_loss_pct * 3.0  # 3:1 risk:reward ratio
         
         # CRITICAL FIX: Clamp percentages to prevent negative take_profit for SHORT positions
@@ -902,6 +1233,9 @@ class SignalGenerator:
         total_fee_rate = (TAKER_FEE_RATE * 2) + (SLIPPAGE_BPS / 10000)
         
         # Use ATR-based stops (consistent with momentum signals)
+        # Handle None atr_pct (use default 1.5%)
+        if atr_pct is None or atr_pct <= 0:
+            atr_pct = 1.5  # Default 1.5% ATR
         stop_loss_pct = atr_pct * SL_ATR_MULTIPLIER
         take_profit_pct = atr_pct * SL_ATR_MULTIPLIER * 3.0  # 3:1 R:R target
         

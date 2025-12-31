@@ -25,7 +25,7 @@ BASE_SCORE_MAX = 100.0
 # Scoring calibration: global multiplier applied to base score before bonuses.
 # 1.0 = old behavior, <1.0 deflates scores to kill "everything is 90+" fantasy.
 # Only scales the numeric score, not changing strategy logic or entry/exit rules.
-SCORING_BASE_SCALE = 0.90  # 90% of previous base (deflates fantasy but keeps good signals above threshold)
+SCORING_BASE_SCALE = 1.0  # DISABLED: 0.90 was causing all scores to be ~18.8, breaking signal filtering
 
 # Percentile + score thresholds for final filtering
 # NOTE: These are fallback values - main config.MIN_SIGNAL_SCORE takes precedence

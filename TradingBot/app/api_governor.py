@@ -115,22 +115,16 @@ class ApiGovernor:
         """
         # CRITICAL: Log entry lane calls (orders) for debugging
         if lane == "entry":
-            try:
-                import sys
-                sys.stderr.write(f"[API_GOV] Entry order queued: cost={cost}, tokens={self._tokens:.1f}, inflight={self._inflight._value}\n")
-            except Exception:
-                pass
+            # Verbose logging disabled - too spammy
+            pass
         
         # 1. Wait for tokens
         await self._wait_tokens(cost=cost, lane=lane)
         
         # CRITICAL: Log when order is about to execute
         if lane == "entry":
-            try:
-                import sys
-                sys.stderr.write(f"[API_GOV] Entry order executing: cost={cost}, tokens={self._tokens:.1f}\n")
-            except Exception:
-                pass
+            # Verbose logging disabled - too spammy
+            pass
         
         # 2. Execute with circuit breaker logic
         async with self._inflight:
@@ -140,19 +134,13 @@ class ApiGovernor:
                     result = await asyncio.wait_for(fn(), timeout=t)
                     # Log successful execution for entry lane
                     if lane == "entry":
-                        try:
-                            import sys
-                            sys.stderr.write(f"[API_GOV] Entry order completed successfully\n")
-                        except Exception:
-                            pass
+                        # Verbose logging disabled - too spammy
+                        pass
                     return result
                 result = await fn()
                 if lane == "entry":
-                    try:
-                        import sys
-                        sys.stderr.write(f"[API_GOV] Entry order completed successfully (no timeout)\n")
-                    except Exception:
-                        pass
+                    # Verbose logging disabled - too spammy
+                    pass
                 return result
             except asyncio.TimeoutError:
                 # CRITICAL: Log timeout for entry orders

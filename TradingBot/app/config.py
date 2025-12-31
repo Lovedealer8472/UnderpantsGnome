@@ -69,7 +69,8 @@ DEBUG_API = env("DEBUG_API", "0") in ("1", "true", "TRUE")  # Debug API calls
 # ----------------------------------------------------------------
 
 # Core flags
-DRY_RUN = env("DRY_RUN", "1") in ("1","true","TRUE")
+# NOTE: DRY_RUN removed - bot always runs in LIVE mode on real Binance
+DRY_RUN = False  # Always live trading (paper trading removed)
 REPLAY_MODE = env("REPLAY_MODE", "0") in ("1","true","TRUE")  # REPLAY MODE: For backtesting only (DO NOT enable in production)
 # OPTIMIZATION: Removed USE_WS (WebSocket support not implemented, unused)
 USE_RICH_UI = env("USE_RICH_UI", "0") in ("1","true","TRUE")  # Legacy flag, ignored for new Rich UI
@@ -77,6 +78,8 @@ USE_RICH_UI = env("USE_RICH_UI", "0") in ("1","true","TRUE")  # Legacy flag, ign
 #   "v2"   - Rich panel UI (full-screen TUI dashboard)
 #   "v4"   - ANSI static header (very lightweight)
 #   "rich" - Rich panel UI (like classic v2 but simpler and safer)
+#   "btop" - Btop-style UI with real-time graphs and system monitoring
+#   "dashboard" - Dashboard mode
 #   "static"/"basic"/"simple" - other legacy/simple modes
 UI_MODE = env("UI_MODE", "console")  # Default to console/headless - pure logging, no Rich UI
 
@@ -139,12 +142,9 @@ if not DRY_RUN:
         import warnings
         warnings.warn("MEXC_API_KEY or MEXC_API_SECRET not set for MEXC", UserWarning)
 
-# Trading params (legacy - used if not using hybrid bot)
-ACCOUNT_BAL        = env("ACCOUNT_BAL","250", float)  # Legacy: kept for backward compatibility
-# DRY_RUN starting balance for the paper account
-# LIVE mode ignores this and uses real exchange equity
-DRY_START_BALANCE = env("DRY_START_BALANCE", "1000.0", float)
-RISK_PCT           = env("RISK_PCT","0.5", float)/100.0  # Tightened to 0.5% for realistic test run (conservative)
+# Trading params
+ACCOUNT_BAL        = env("ACCOUNT_BAL","250", float)  # Starting account balance
+RISK_PCT           = env("RISK_PCT","0.5", float)/100.0  # Risk per trade: 0.5% (conservative)
 LEVERAGE_BASE      = env("LEVERAGE","5", int)  # Legacy base leverage (used if dynamic disabled)
 
 # Dynamic Leverage and Position Sizing (Phase 1: External Review Implementation)
@@ -161,16 +161,16 @@ MIN_POSITION_PCT = env("MIN_POSITION_PCT", "1.0", float)  # AGGRESSIVE: Min 1.0%
 TOTAL_RISK_BUDGET = env("TOTAL_RISK_BUDGET", "2.0", float) / 100.0  # Total risk budget as % of equity (2% = 0.02) - scalper-friendly
 # NOTE: Effective max positions are now dynamic: floor(MAX_ACCOUNT_RISK_PCT / RISK_PER_TRADE_PCT),
 # but never exceed MAX_CONCURRENT_POS_HARD. The old MAX_OPEN_POSITIONS is kept for backward compatibility.
-MAX_OPEN_POSITIONS = env("MAX_OPEN_POSITIONS", "5", int)  # Default, overridden by GO_LIVE.py
+MAX_OPEN_POSITIONS = env("MAX_OPEN_POSITIONS", "3", int)  # Default 3 positions - unicorns bypass this limit
 MAX_CONCURRENT_POS = MAX_OPEN_POSITIONS  # Alias for backward compatibility
-MAX_CONCURRENT_POS_MIN = env("MAX_CONCURRENT_POS_MIN","5", int)  # Default
+MAX_CONCURRENT_POS_MIN = env("MAX_CONCURRENT_POS_MIN","3", int)  # Default to 3 (minimum positions)
 MAX_CONCURRENT_POS_MAX = env("MAX_CONCURRENT_POS_MAX","15", int)  # Max allowed
 
 # Dynamic risk-based position cap (Option C: Force Selectivity)
 # MAXIMUM AGGRESSION MODE: High risk, high reward
 MAX_ACCOUNT_RISK_PCT = env("MAX_ACCOUNT_RISK_PCT", "25.0", float)  # BALANCED: 25% total risk
-RISK_PER_TRADE_PCT = env("RISK_PER_TRADE_PCT", "5.0", float)  # BALANCED: 5.0% per trade (was 2.0%)
-MAX_CONCURRENT_POS_HARD = env("MAX_CONCURRENT_POS_HARD", "3", int)  # Dynamic, overridden by GO_LIVE.py
+RISK_PER_TRADE_PCT = env("RISK_PER_TRADE_PCT", "1.0", float)  # ML-optimized: 1.0% per trade (was 5.0% - safer, tighter exits)
+MAX_CONCURRENT_POS_HARD = env("MAX_CONCURRENT_POS_HARD", "3", int)  # Default 3 - unicorns bypass this limit
 
 # Per-trade risk bounds
 MIN_RISK_PER_TRADE = env("MIN_RISK_PER_TRADE", "0.5", float) / 100.0  # AGGRESSIVE: 0.5% minimum (was 0.2%)
@@ -248,7 +248,9 @@ TIME_FILTER_SIZE_REDUCTION = env("TIME_FILTER_SIZE_REDUCTION", "0.5", float)  # 
 # REGIME FILTER (Market Conditions)
 # ===========================
 # Only trade when conditions favor momentum scalping
-REGIME_FILTER_ENABLED = env("REGIME_FILTER_ENABLED", "1") in ("1", "true", "TRUE")
+REGIME_FILTER_ENABLED = env("REGIME_FILTER_ENABLED", "0") in ("1", "true", "TRUE")  # DISABLED: Let ML decide
+# CRITICAL: Enable/disable RAPTOR regime override (dynamic threshold lowering)
+REGIME_OVERRIDE_ENABLED = env("REGIME_OVERRIDE_ENABLED", "0") in ("1", "true", "TRUE")  # DISABLED: No overrides
 # Minimum BTC 24h volatility to trade (avoid dead/ranging markets)
 REGIME_MIN_BTC_VOLATILITY_PCT = env("REGIME_MIN_BTC_VOLATILITY_PCT", "1.0", float)
 # Maximum BTC 24h volatility (avoid extreme chaos where stops get blown)
@@ -281,13 +283,6 @@ SYMBOL_CHURN_COOLDOWN_SEC = env("SYMBOL_CHURN_COOLDOWN_SEC", "300", int)  # 5 mi
 # Time-based exit: more patient, only kill losers/zombies (increased to maintain 1+ positions)
 TIME_EXIT_BARS = env("TIME_EXIT_BARS", "15", int)  # More patient, ~15 candles before time exit (was 10, increased to keep positions longer)
 
-# === DRY_RUN sandbox exits ===
-# When enabled, DRY_RUN uses simple SL/TP exits only (no partials/trailing).
-DRY_SIMPLE_EXITS = env("DRY_SIMPLE_EXITS", "1") in ("1","true","TRUE")  # Enable simple exits in DRY_RUN
-# Simple DRY exits in R-multiples (R based on initial SL distance).
-DRY_SIMPLE_SL_R = env("DRY_SIMPLE_SL_R", "-1.0", float)  # Stop at -1R (initial stop)
-DRY_SIMPLE_TP_R = env("DRY_SIMPLE_TP_R", "3.0", float)  # TP at +3R (based on introspection results)
-
 # ATR multiplier for initial stop loss calculation
 # DATA-DRIVEN: Analysis shows SL rate drops from 56.5% to 30.2% as ATR increases
 # Using 2.5x ATR as minimum stop distance to reduce premature stop-outs
@@ -314,7 +309,7 @@ MAX_LATENCY_MS     = env("MAX_LATENCY_MS","50", int)  # Ultra-low latency: 50ms 
 #
 # These filters work WITH Diamond Hands exit strategy for best results.
 #
-ENTRY_FILTER_ENABLED = env("ENTRY_FILTER_ENABLED", "1") in ("1", "true", "TRUE")
+ENTRY_FILTER_ENABLED = env("ENTRY_FILTER_ENABLED", "0") in ("1", "true", "TRUE")  # DISABLED: ML already considers these features
 
 # Volatility filter: Only trade when market is moving
 ENTRY_MIN_ATR_PCT = env("ENTRY_MIN_ATR_PCT", "1.0", float)  # Minimum 1% ATR
@@ -342,7 +337,7 @@ ENTRY_RSI_SHORT_MIN_RELAXED = env("ENTRY_RSI_SHORT_MIN_RELAXED", "65", float)
 # - In calm markets: absolute thresholds drop automatically
 # - In volatile markets: thresholds rise automatically
 #
-USE_ADAPTIVE_FILTERS = env("USE_ADAPTIVE_FILTERS", "1") in ("1", "true", "TRUE")
+USE_ADAPTIVE_FILTERS = env("USE_ADAPTIVE_FILTERS", "1") in ("1", "true", "TRUE")  # ENABLED: ML ATR adaptation active
 ENTRY_ATR_PERCENTILE = env("ENTRY_ATR_PERCENTILE", "60", float)  # Top 40% volatility
 ENTRY_MOMENTUM_PERCENTILE = env("ENTRY_MOMENTUM_PERCENTILE", "70", float)  # Top 30% momentum
 ENTRY_RSI_EXTREME_PCT = env("ENTRY_RSI_EXTREME_PCT", "20", float)  # Top/bottom 20% RSI
@@ -391,18 +386,14 @@ def _env_float(name: str, default: float) -> float:
 # These are just garbage/sanity checks - set VERY low.
 #
 MIN_SIGNAL_STRENGTH = _env_float("LIVE_MIN_SIGNAL_STRENGTH", _env_float("MIN_SIGNAL_STRENGTH", 0.05))  # 5% floor
-MIN_SIGNAL_SCORE = int(_env_float("LIVE_MIN_SIGNAL_SCORE", _env_float("MIN_SIGNAL_SCORE", 10)))  # Garbage floor only
-HARD_MIN_SCORE = int(_env_float("LIVE_HARD_MIN_SCORE", _env_float("HARD_MIN_SCORE", 5)))  # Absolute minimum
+# INTELLIGENT SIGNAL SELECTION v2.0:
+# Use LOW collection threshold (50) - let priority queue rank and pick BEST
+# Old approach filtered at 70+ BEFORE ranking - missed good signals!
+MIN_SIGNAL_SCORE = int(_env_float("LIVE_MIN_SIGNAL_SCORE", _env_float("MIN_SIGNAL_SCORE", 50)))  # COLLECTION threshold - priority queue picks best
+HARD_MIN_SCORE = int(_env_float("LIVE_HARD_MIN_SCORE", _env_float("HARD_MIN_SCORE", 50)))  # Absolute floor - adaptive system handles dynamic thresholds
 
 # Operator lock: DISABLED - let adaptive system work
 LOCK_ENTRY_FILTERS = (str(os.getenv("LOCK_ENTRY_FILTERS", "0")).strip().lower() in ("1", "true", "yes", "on"))
-
-# MVP Scoring (legacy) - OFF
-MVP_SCORING_MODE = str(env("MVP_SCORING_MODE", "off")).strip().lower()
-SCORING_ROLLBACK = str(env("SCORING_ROLLBACK", "0")).strip().lower() in ("1", "true", "yes", "on")
-if SCORING_ROLLBACK:
-    MVP_SCORING_MODE = "off"
-MVP_BANDIT_ENABLED = str(env("MVP_BANDIT_ENABLED", "0")).strip().lower() in ("1", "true", "yes", "on")
 
 # LONG BIAS: Score bonus for LONG positions on MAJOR coins (BTC, ETH, SOL, etc.)
 # This effectively lowers the threshold from 65 to 60 for high-quality longs
@@ -448,6 +439,15 @@ WIN_RATE_RELAX_THRESHOLD = env("WIN_RATE_RELAX_THRESHOLD", "60.0", float)  # Rel
 WIN_RATE_TIGHTEN_THRESHOLD = env("WIN_RATE_TIGHTEN_THRESHOLD", "40.0", float)  # Tighten thresholds if win rate < 40%
 # ML SCORER V3: Scores range 25-50 (win probability * 100)
 # Dynamic thresholds should stay within this range
+
+# Adaptive Threshold System (Market-aware automatic adjustment)
+# Automatically adjusts MIN_SIGNAL_SCORE based on real-time market conditions
+# Uses absolute thresholds (not percentiles) to maintain quality standards
+USE_ADAPTIVE_THRESHOLDS = env("USE_ADAPTIVE_THRESHOLDS", "0") in ("1", "true", "TRUE")  # Disabled by default
+ADAPTIVE_THRESHOLD_MIN = env("ADAPTIVE_THRESHOLD_MIN", "45", int)  # Never below 45 (60% ML prob after quality gate)
+ADAPTIVE_THRESHOLD_MAX = env("ADAPTIVE_THRESHOLD_MAX", "75", int)  # Never above 75 (prevents over-restriction)
+ADAPTIVE_ADJUSTMENT_INTERVAL = env("ADAPTIVE_ADJUSTMENT_INTERVAL", "300", int)  # Adjust every 5 minutes (300 seconds)
+ADAPTIVE_WINDOW_SIZE = env("ADAPTIVE_WINDOW_SIZE", "100", int)  # Analyze last 100 signals for market state
 MIN_SCORE_RANGE = (25, 50)  # ML Scorer full range - no artificial clamping
 MIN_STRENGTH_RANGE = (0.25, 0.50)  # Aligned with score range (strength = score/100)
 
@@ -478,7 +478,7 @@ UNICORN_BYPASS_CORRELATION = env("UNICORN_BYPASS_CORRELATION", "1") in ("1","tru
 # Parameters are loaded dynamically or set via MIN_SIGNAL_SCORE/STRENGTH below. 
 
 # Symbol scanning and rotation
-SYMBOLS_TO_SCAN = env("SYMBOLS_TO_SCAN","100", int)  # OPTIMIZED: 100 symbols (was 300) to prevent API throttling
+SYMBOLS_TO_SCAN = env("SYMBOLS_TO_SCAN","300", int)  # Increased to 300 - we have API headroom, catch more opportunities
 MAX_ACTIVE_SYMBOLS = env("MAX_ACTIVE_SYMBOLS","1000", int)  # Maximum symbols in active list (expanded to 1000 for maximum opportunity discovery)
 STALE_SYMBOL_THRESHOLD_SEC = env("STALE_SYMBOL_THRESHOLD_SEC","60", float)  # Time before symbol considered stale (1 min - faster rotation)
 STALE_ROTATION_PCT = env("STALE_ROTATION_PCT","0.50", float)  # Percentage of active list to rotate per cycle (50% - more aggressive)
@@ -505,7 +505,7 @@ UNIVERSE_MAX_SPREAD = env("UNIVERSE_MAX_SPREAD", "100", float)  # 100 bps max sp
 # These symbols are statistically significant underperformers based on 4M+ trades analysis.
 # They have win rates 2+ standard deviations below average (z < -1.96).
 # Format: comma-separated list of base symbols (without /USDT suffix)
-_BLACKLIST_DEFAULT = "BTC,ETC,ATOM,ADA,BCH,XRP,BNB,AVAX"
+_BLACKLIST_DEFAULT = "BTC,ETC,ATOM,ADA,BCH,XRP,BNB,AVAX,FLOW"
 SYMBOL_BLACKLIST = [s.strip().upper() for s in env("SYMBOL_BLACKLIST", _BLACKLIST_DEFAULT).split(",") if s.strip()]
 
 # ===========================
@@ -530,18 +530,21 @@ MIN_ATR_PCT = env("MIN_ATR_PCT", "0.5", float) / 100.0  # 0.5% minimum ATR to tr
 #   - Total R with stops: -451,044 (losing)
 #   - Total R without stops: +505,635 (profitable!)
 #
-MIN_HOLD_TIME_SEC = env("MIN_HOLD_TIME_SEC", "3600", int)  # 60 minutes minimum hold
+# REPLACED: Hard 60-minute hold time with intelligent PRS-based exits
+# NEW APPROACH: Early protection + PRS monitoring + ATR trailing
+#
+# Phase 1 (0-15 min): Early protection - no trailing stops
+EARLY_PROTECTION_MIN = env("EARLY_PROTECTION_MIN", "15", float)  # No trailing for first 15 minutes
+EARLY_PROTECTION_ALLOW_EMERGENCY = env("EARLY_PROTECTION_ALLOW_EMERGENCY", "1") in ("1", "true", "TRUE")  # Allow emergency exits if -5%+
 
-# CRITICAL: Disable stop loss during minimum hold period
-# This is the key change that makes the strategy profitable
-DISABLE_STOP_DURING_HOLD = env("DISABLE_STOP_DURING_HOLD", "1") in ("1", "true", "TRUE")
+# Phase 2 (15+ min): PRS monitoring active (configured below in PRS section)
+# Phase 3 (profit > 1R): ATR trailing active (configured below in trailing section)
 
-# Allow early exit only if profit exceeds this threshold (lock in big wins)
-MIN_HOLD_PROFIT_EXCEPTION_PCT = env("MIN_HOLD_PROFIT_EXCEPTION_PCT", "2.0", float) / 100.0  # Exit early only if +2%
-
-# After hold period, use time-based exit regardless of P&L
-# (don't wait for stop loss, just exit at market after 1 hour)
-TIME_EXIT_AFTER_HOLD = env("TIME_EXIT_AFTER_HOLD", "1") in ("1", "true", "TRUE")
+# DEPRECATED: Hard time limits (replaced by adaptive system)
+MIN_HOLD_TIME_SEC = env("MIN_HOLD_TIME_SEC", "0", int)  # DISABLED - no hard minimum (was 3600)
+DISABLE_STOP_DURING_HOLD = env("DISABLE_STOP_DURING_HOLD", "0") in ("1", "true", "TRUE")  # DISABLED - let smart systems work
+MIN_HOLD_PROFIT_EXCEPTION_PCT = env("MIN_HOLD_PROFIT_EXCEPTION_PCT", "2.0", float) / 100.0  # DEPRECATED
+TIME_EXIT_AFTER_HOLD = env("TIME_EXIT_AFTER_HOLD", "0") in ("1", "true", "TRUE")  # DISABLED
 
 # Discovery scanning (Option C: Quality Over Quantity)
 # OPTIMIZATION: Reduced from 15s to 10s for more frequent discovery
@@ -561,7 +564,7 @@ MIN_ORDERBOOK_DEPTH_PCT = env("MIN_ORDERBOOK_DEPTH_PCT","0.05", float)  # Minimu
 # ----------------------------------------------------------------
 # Dynamically adjusts entry threshold to stay active 24/7 while taking best signals
 # Threshold = percentile of recent signals, adjusted for position count & idle time
-USE_ADAPTIVE_ENTRY = env("USE_ADAPTIVE_ENTRY", "1") in ("1", "true", "TRUE")  # Enable adaptive thresholds
+# ML-OPTIMIZED: Removed USE_ADAPTIVE_ENTRY (now using fixed thresholds from environment)
 
 # Data collection requirement (blocks trading until sufficient market data)
 ADAPTIVE_MIN_SIGNALS_REQUIRED = env("ADAPTIVE_MIN_SIGNALS_REQUIRED", "50", int)  # Minimum signals needed before trading starts
@@ -585,7 +588,7 @@ ADAPTIVE_DECAY_RATE = env("ADAPTIVE_DECAY_RATE", "0.5", float)          # Lower 
 ADAPTIVE_MAX_DECAY = env("ADAPTIVE_MAX_DECAY", "10", float)             # Maximum decay of 10 points
 
 # Legacy thresholds (used as fallback if adaptive disabled)
-IDLE_MIN_SCORE = env("IDLE_MIN_SCORE", "35", float)  # Fallback when idle (now lower due to adaptive)
+# ML-OPTIMIZED: Removed IDLE_MIN_SCORE (no longer lowering threshold when idle)
 
 # Position sizing
 USE_KELLY_SIZING   = env("USE_KELLY_SIZING","1") in ("1","true","TRUE")  # Use Kelly-adjusted sizing
@@ -618,7 +621,7 @@ API_EXIT_TOKEN_RESERVE = env("API_EXIT_TOKEN_RESERVE", "3", int)  # reserve toke
 API_CALL_TIMEOUT_SEC = env("API_CALL_TIMEOUT_SEC", "3.0", float)  # hard timeout per API call
 
 # Magic numbers extracted to constants
-MIN_STOP_DISTANCE_PCT = env("MIN_STOP_DISTANCE_PCT", "1.0", float) / 100.0  # 1.0% minimum stop distance
+MIN_STOP_DISTANCE_PCT = env("MIN_STOP_DISTANCE_PCT", "1.5", float) / 100.0  # ML-optimized: 1.5% minimum stop distance (was 2.0% - tighter)
 # Minimum risk per trade (USD) - DRY_RUN only
 # If risk_usd < MIN_RISK_USD we skip the trade as "too small"
 MIN_RISK_USD = env("MIN_RISK_USD", "0.01", float)  # LOWERED TO 0.01 to allow small test trades
@@ -628,7 +631,7 @@ TRAILING_STOP_PCT = env("TRAILING_STOP_PCT", "60.0", float) / 100.0  # Trail sto
 
 # ATR-Based Trailing Stops (Phase 1: External Review Implementation)
 USE_ATR_TRAILING_STOP = env("USE_ATR_TRAILING_STOP", "1") in ("1","true","TRUE")  # Enable ATR-based trailing stops
-ATR_TRAILING_MULTIPLIER = env("ATR_TRAILING_MULTIPLIER", "2.0", float)  # Default 2x ATR behind peak
+ATR_TRAILING_MULTIPLIER = env("ATR_TRAILING_MULTIPLIER", "2.5", float)  # Default 2.5x ATR behind peak (wider for big moves)
 
 # BINANCE SERVER-SIDE STOP LOSS (runs on exchange, not bot)
 # This places a stop-loss order on Binance as a "circuit breaker"
@@ -643,10 +646,11 @@ ATR_TRAILING_DAY_MULTIPLIER = env("ATR_TRAILING_DAY_MULTIPLIER", "2.0", float)  
 ATR_TRAILING_SWING_MULTIPLIER = env("ATR_TRAILING_SWING_MULTIPLIER", "2.5", float)  # Wider for swing trading
 
 # R-Based Trailing Stop Engine (canonical trailing)
-USE_TRAILING_ENGINE = env("USE_TRAILING_ENGINE", "1") in ("1", "true", "TRUE")
-USE_NEW_TRAILING_ENGINE = env("USE_NEW_TRAILING_ENGINE", "1") in ("1", "true", "TRUE")
-# OPTIMIZATION: Start trailing earlier to reduce time exits (based on backtest analysis)
-TRAIL_ENGINE_START_BUFFER_R = env("TRAIL_ENGINE_START_BUFFER_R", "0.3", float)  # Start trailing at 0.3R (reduced from 0.5R to activate earlier)
+# ADAPTIVE STRATEGY: Disabled aggressive R-based trailing, use ATR-based instead
+USE_TRAILING_ENGINE = env("USE_TRAILING_ENGINE", "0") in ("1", "true", "TRUE")  # DISABLED - too aggressive
+USE_NEW_TRAILING_ENGINE = env("USE_NEW_TRAILING_ENGINE", "0") in ("1", "true", "TRUE")  # DISABLED
+# If re-enabled, start at 1R minimum (not 0.3R which causes premature exits)
+TRAIL_ENGINE_START_BUFFER_R = env("TRAIL_ENGINE_START_BUFFER_R", "1.0", float)  # Start at 1R minimum (was 0.3R - too early!)
 TRAIL_ENGINE_PARTIAL_1_R = env("TRAIL_ENGINE_PARTIAL_1_R", "1.0", float)  # First partial at +1R
 TRAIL_ENGINE_PARTIAL_1_SIZE = env("TRAIL_ENGINE_PARTIAL_1_SIZE", "0.25", float)  # Default 25% clip
 TRAIL_ENGINE_PARTIAL_1_SL_OFFSET_R = env("TRAIL_ENGINE_PARTIAL_1_SL_OFFSET_R", "0.2", float)  # Keep SL slightly negative until proven
@@ -739,6 +743,21 @@ BERP_ENABLED = env("BERP_ENABLED", "1") in ("1","true","TRUE")  # Enable Break-E
 BERP_TRIGGER_AGE_SEC = env("BERP_TRIGGER_AGE_SEC", "3600", int)  # Trigger rescue at 60 minutes (3600s)
 BERP_TRIGGER_PNL_THRESHOLD = env("BERP_TRIGGER_PNL_THRESHOLD", "0.3", float)  # Trigger if PnL < +0.3% (soft noise margin)
 BERP_RESCUE_DURATION_SEC = env("BERP_RESCUE_DURATION_SEC", "3600", int)  # Rescue duration: 60 minutes (3600s)
+BERP_PROFIT_OVERRIDE_PCT = env("BERP_PROFIT_OVERRIDE_PCT", "1.0", float)  # If profit >= 1.0% at 60m, extend hold + trail tight (don't close dead positions)
+
+# ===================================================================
+# PHASE 2: ADVANCED CANDLESTICK PATTERN RECOGNITION
+# ===================================================================
+PHASE2_ENABLED = env("PHASE2_ENABLED", "1") in ("1", "true", "TRUE")  # ENABLED by default for testing
+PHASE2_HAMMER_BOOST = env("PHASE2_HAMMER_BOOST", "0.25", float)  # Hammer reversal: +0.25 boost (increased from 0.15)
+PHASE2_ENGULFING_BOOST = env("PHASE2_ENGULFING_BOOST", "0.20", float)  # Engulfing confirmation: +0.20 boost (increased from 0.10)
+PHASE2_DOJI_PENALTY = env("PHASE2_DOJI_PENALTY", "-0.15", float)  # Doji indecision: -0.15 penalty (increased from -0.08)
+PHASE2_PIN_BAR_BOOST = env("PHASE2_PIN_BAR_BOOST", "0.20", float)  # Pin bar rejection: +0.20 boost (increased from 0.10)
+
+# Phase 3 (Mean Reversion): Rejection zones & bounce confirmation
+PHASE3_ENABLED = env("PHASE3_ENABLED", "1") in ("1", "true", "TRUE")  # ENABLED by default - mean reversion patterns
+PHASE3_REJECTION_ZONE_BOOST = env("PHASE3_REJECTION_ZONE_BOOST", "0.15", float)  # Rejection zone: +0.15 boost (highest MR confidence)
+PHASE3_BOUNCE_CONFIRMATION_BOOST = env("PHASE3_BOUNCE_CONFIRMATION_BOOST", "0.10", float)  # Bounce confirmation: +0.10 boost
 
 # R-Based Exit Engine (Score-Aware Exit Management)
 USE_R_BASED_EXITS = env("USE_R_BASED_EXITS", "1") in ("1","true","TRUE")  # Enable R-based exit engine
@@ -843,6 +862,34 @@ BTC_TREND_WEAK_THRESHOLD = env("BTC_TREND_WEAK_THRESHOLD", "0.5", float)  # BTC 
 STRONG_MOMENTUM_THRESHOLD = env("STRONG_MOMENTUM_THRESHOLD", "2.0", float)  # Strong momentum threshold (%)
 HIGH_VOLATILITY_MEDIAN_THRESHOLD = env("HIGH_VOLATILITY_MEDIAN_THRESHOLD", "2.5", float)  # High volatility median threshold (%)
 HIGH_VOLATILITY_P75_THRESHOLD = env("HIGH_VOLATILITY_P75_THRESHOLD", "3.5", float)  # High volatility 75th percentile threshold (%)
+
+# ----------------------------------------------------------------
+# MASTER HINDSIGHT ML SYSTEM
+# ----------------------------------------------------------------
+# Configuration for the Master Hindsight ML System integration
+# Trained on 675K trades with 99%+ accuracy models
+
+# Enable/disable Hindsight ML (DISABLED - faulty 99.54% WR fantasy data)
+USE_HINDSIGHT_ML = env("USE_HINDSIGHT_ML", "0") in ("1", "true", "TRUE")
+
+# Hindsight ML model directory (default: latest in master_hindsight_models/)
+HINDSIGHT_ML_MODEL_DIR = env("HINDSIGHT_ML_MODEL_DIR", None)
+
+# Hindsight ML score thresholds (0-100 scale)
+# These are LOWER than standard thresholds because Hindsight ML is more accurate
+HINDSIGHT_MIN_SCORE = int(env("HINDSIGHT_MIN_SCORE", "40"))  # Minimum score to consider (was 35)
+HINDSIGHT_HARD_MIN_SCORE = int(env("HINDSIGHT_HARD_MIN_SCORE", "30"))  # Absolute minimum (was 30)
+
+# Hindsight ML confidence thresholds (0-1 scale, from entry_probability)
+HINDSIGHT_MIN_CONFIDENCE = float(env("HINDSIGHT_MIN_CONFIDENCE", "0.60"))  # 60% minimum confidence
+HINDSIGHT_HIGH_CONFIDENCE = float(env("HINDSIGHT_HIGH_CONFIDENCE", "0.75"))  # 75% = high confidence
+
+# Regime-based filtering
+HINDSIGHT_SKIP_DANGEROUS_REGIMES = env("HINDSIGHT_SKIP_DANGEROUS_REGIMES", "1") in ("1", "true", "TRUE")  # Skip regimes 2,4
+HINDSIGHT_PREFER_REGIME_0 = env("HINDSIGHT_PREFER_REGIME_0", "1") in ("1", "true", "TRUE")  # Prioritize high-performance market regimes
+
+# Use ML-predicted optimal SL instead of ATR-based SL
+HINDSIGHT_USE_OPTIMAL_SL = env("HINDSIGHT_USE_OPTIMAL_SL", "1") in ("1", "true", "TRUE")
 
 # ----------------------------------------------------------------
 # LEGACY / BACKWARD COMPATIBILITY

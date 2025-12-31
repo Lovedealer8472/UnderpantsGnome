@@ -90,8 +90,14 @@ class RecoveryModule:
         entry_time = position.get('entry_time', now)
         age_minutes = (now - entry_time) / 60.0 if entry_time > 0 else 0.0
         
-        # Guardrail: PRS only active after minimum age
-        if age_minutes < PRS_MIN_AGE_MIN:
+        # Guardrail: PRS only active after minimum age (skip for adopted positions)
+        is_adopted = position.get('is_adopted', False)
+        if age_minutes < PRS_MIN_AGE_MIN and not is_adopted:
+            return None
+        
+        # Guardrail: Skip PRS for adopted positions (manage with trailing/SL only)
+        if is_adopted:
+            self.logger.debug(f"[PRS] {symbol}: Skipping - adopted position (managed by trailing/SL)")
             return None
         
         # Guardrail: Check data freshness

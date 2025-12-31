@@ -13,7 +13,7 @@ import time
 from typing import Optional, Dict, Any, Tuple
 from dataclasses import dataclass
 from ..config import (
-    DRY_RUN, TIME_EXIT_BARS, DRY_SIMPLE_EXITS, DRY_SIMPLE_SL_R, DRY_SIMPLE_TP_R,
+    TIME_EXIT_BARS,
     # Data-driven hold time (from 4M+ trades analysis)
     MIN_HOLD_TIME_SEC, MIN_HOLD_PROFIT_EXCEPTION_PCT,
     # Diamond Hands strategy
@@ -29,14 +29,6 @@ class ScalperExitAction:
     exit_reason: Optional[str] = None
     exit_size_ratio: float = 1.0  # 1.0 = full exit
     exit_price: Optional[float] = None  # Trigger price for execution
-
-def _is_dry_simple_exits() -> bool:
-    """
-    Check if DRY_RUN simple exits mode is enabled.
-    DRY sandbox mode: only hard SL and hard TP exits, no partials/trailing.
-    """
-    return bool(DRY_RUN and DRY_SIMPLE_EXITS)
-
 
 def _evaluate_simple_dry_exit(
     position: Dict[str, Any],
@@ -78,8 +70,8 @@ def _evaluate_simple_dry_exit(
     else:  # short
         current_r = (entry_price - current_price) / risk_per_unit
     
-    # Hard stop loss at DRY_SIMPLE_SL_R or worse
-    sl_r = float(DRY_SIMPLE_SL_R)
+    # Hard stop loss at -1.0R or worse
+    sl_r = -1.0
     if current_r <= sl_r:
         return ScalperExitAction(
             action="exit",
@@ -88,8 +80,9 @@ def _evaluate_simple_dry_exit(
             exit_price=current_price
         )
     
-    # Hard take-profit at DRY_SIMPLE_TP_R or better
-    tp_r = float(DRY_SIMPLE_TP_R)
+    # Hard take-profit at 2.0R or better (live mode)
+    tp_r = 2.0
+
     if current_r >= tp_r:
         return ScalperExitAction(
             action="exit",
@@ -146,71 +139,10 @@ def evaluate_scalper_trailing(
         position['initial_stop_price'] = initial_stop
         position['stop_loss'] = initial_stop
     
-    # DRY_RUN simple exits: bypass all trailing/partial logic, use simple SL/TP only
-    # BUT respect Diamond Hands strategy if enabled
-    if _is_dry_simple_exits():
-        import time as _time
-        hold_time_sec = _time.time() - entry_time
-        min_hold_active = MIN_HOLD_TIME_SEC > 0 and hold_time_sec < MIN_HOLD_TIME_SEC
-        hold_expired = MIN_HOLD_TIME_SEC > 0 and hold_time_sec >= MIN_HOLD_TIME_SEC
-        
-        # Diamond Hands: After hold period expires, exit immediately
-        if TIME_EXIT_AFTER_HOLD and hold_expired:
-            # Calculate current R for logging
-            risk_per_unit = abs(entry_price - initial_stop) if initial_stop > 0 else entry_price * 0.01
-            if side == "long":
-                current_r = (current_price - entry_price) / risk_per_unit if risk_per_unit > 0 else 0
-            else:
-                current_r = (entry_price - current_price) / risk_per_unit if risk_per_unit > 0 else 0
-            return ScalperExitAction(
-                action="exit",
-                exit_reason=f"time_exit_diamond_hands ({hold_time_sec/60:.0f}min, R={current_r:.2f})",
-                exit_size_ratio=1.0,
-                exit_price=current_price
-            )
-        
-        # Diamond Hands during hold: NO stops allowed
-        if DISABLE_STOP_DURING_HOLD and min_hold_active:
-            # Check for early profit lock
-            profit_pct = ((current_price - entry_price) / entry_price) if side == "long" else ((entry_price - current_price) / entry_price)
-            if profit_pct >= MIN_HOLD_PROFIT_EXCEPTION_PCT:
-                return ScalperExitAction(
-                    action="exit",
-                    exit_reason=f"early_profit_lock ({profit_pct*100:.1f}%, {hold_time_sec/60:.0f}min)",
-                    exit_size_ratio=1.0,
-                    exit_price=current_price
-                )
-            # Otherwise, HODL - no exit
-            return None
-        
-        # Legacy mode: Check hard SL first (price hit stop)
-        if side == "long" and current_price <= current_stop:
-            return ScalperExitAction(
-                action="exit",
-                exit_reason="stop_loss_hit",
-                exit_size_ratio=1.0,
-                exit_price=current_price
-            )
-        elif side == "short" and current_price >= current_stop:
-            return ScalperExitAction(
-                action="exit",
-                exit_reason="stop_loss_hit",
-                exit_size_ratio=1.0,
-                exit_price=current_price
-            )
-        
-        # Use simple DRY exit logic (hard SL/TP in R-space)
-        return _evaluate_simple_dry_exit(
-            position=position,
-            current_price=current_price,
-            atr_pct=atr_pct,
-            side=side,
-            entry_price=entry_price,
-            initial_stop=initial_stop
-        )
+    # Always live mode - use full trailing/partial exit logic
     
-    # LIVE/NORMAL path: full exit engine with trailing/partials
-    
+    # (Full trailing stop implementation continues below)
+
     # Calculate profit in ATR units
     if side == "long":
         profit_pct = ((current_price - entry_price) / entry_price)
@@ -347,7 +279,9 @@ def evaluate_scalper_trailing(
                 )
         else:  # short
             new_stop = entry_price * (1.0 - 0.05 * atr_pct)
-            if new_stop < current_stop or current_stop == 0:  # Only move stop down
+            # FIX: For SHORT break-even, move stop DOWN (closer to entry from below)
+            # Keep the HIGHEST stop price ever seen
+            if new_stop > current_stop or current_stop == 0:  # Move stop HIGHER (tighter) for shorts
                 return ScalperExitAction(
                     action="update_sl",
                     new_stop=new_stop,
@@ -367,10 +301,16 @@ def evaluate_scalper_trailing(
         # 3. Victory Lap (5.0+ ATR Profit): Tighten (0.2 ATR) to lock in massive gains.
         if profit_atr > 5.0:
             trail_mult = 0.2
+        
+        # CRITICAL: Calculate trail distance with MINIMUM floor
+        # Low-ATR coins would have stops too tight without this
+        trail_distance = trail_mult * atr_pct
+        MIN_TRAIL_DISTANCE = 0.003  # 0.3% minimum trail distance
+        trail_distance = max(trail_distance, MIN_TRAIL_DISTANCE)
             
         # Use trailing stop tied to current price
         if side == "long":
-            new_stop = current_price * (1.0 - trail_mult * atr_pct)
+            new_stop = current_price * (1.0 - trail_distance)
             if new_stop > current_stop:  # Only move stop up
                 return ScalperExitAction(
                     action="update_sl",
@@ -378,8 +318,10 @@ def evaluate_scalper_trailing(
                     exit_reason=None
                 )
         else:  # short
-            new_stop = current_price * (1.0 + trail_mult * atr_pct)
-            if new_stop < current_stop or current_stop == 0:  # Only move stop down
+            new_stop = current_price * (1.0 + trail_distance)
+            # FIX: For SHORT, move stop UP (closer to entry) when price moves favorably DOWN
+            # Keep the HIGHEST stop price ever seen (tightest for shorts)
+            if new_stop > current_stop or current_stop == 0:  # Move stop HIGHER (tighter) for shorts
                 return ScalperExitAction(
                     action="update_sl",
                     new_stop=new_stop,

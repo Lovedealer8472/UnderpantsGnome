@@ -83,6 +83,19 @@ class SignalHealth:
 
 
 @dataclass
+class MLFrameworkStatus:
+    """ML Framework status and metrics."""
+    signal_scorer_loaded: bool  # Is ML scorer model loaded?
+    signal_scorer_error: Optional[str]  # Error message if failed
+    signal_scorer_predictions: int  # Total predictions made
+    signal_scorer_avg_time_ms: float  # Average prediction time
+    parameter_optimizer_available: bool  # Is parameter optimizer available?
+    evolution_learner_available: bool  # Is evolution learner available?
+    filter_stats: Dict[str, int]  # Unified filter statistics
+    filter_pass_rate: float  # Filter pass rate (0-100%)
+
+
+@dataclass
 class RiskSnapshot:
     """Risk and market conditions."""
     open_positions: int
@@ -117,6 +130,14 @@ class PositionSnapshot:
     dd_time: Optional[str]  # e.g., "12m", "1h05m"
     is_unicorn: bool
     current_r: Optional[float] = None  # Current R multiple (from trailing engine)
+    # Binance market data
+    bid_price: Optional[float] = None  # Bid price from exchange
+    ask_price: Optional[float] = None  # Ask price from exchange
+    spread_bps: Optional[float] = None  # Bid-ask spread in basis points
+    vol_24h_quote: Optional[float] = None  # 24h volume in quote currency
+    pct_change_24h: Optional[float] = None  # 24h price change %
+    stop_loss_price: Optional[float] = None  # Stop loss price level
+    take_profit_price: Optional[float] = None  # Take profit price level
 
 
 @dataclass
@@ -164,6 +185,19 @@ class LLMMessage:
 
 
 @dataclass
+class MLFrameworkStatus:
+    """ML Framework status and metrics."""
+    signal_scorer_loaded: bool  # Is ML scorer model loaded?
+    signal_scorer_error: Optional[str]  # Error message if failed
+    signal_scorer_predictions: int  # Total predictions made
+    signal_scorer_avg_time_ms: float  # Average prediction time
+    parameter_optimizer_available: bool  # Is parameter optimizer available?
+    evolution_learner_available: bool  # Is evolution learner available?
+    filter_stats: Dict[str, int]  # Unified filter statistics
+    filter_pass_rate: float  # Filter pass rate (0-100%)
+
+
+@dataclass
 class EngineSnapshot:
     """Complete engine state snapshot for UI v2."""
     timestamp: datetime
@@ -171,6 +205,7 @@ class EngineSnapshot:
     performance: Performance
     signal_health: SignalHealth
     risk: RiskSnapshot
+    ml_framework: Optional[MLFrameworkStatus] = None  # ML Framework status
     open_positions: List[PositionSnapshot] = field(default_factory=list)
     recent_activity: List[ActivityEvent] = field(default_factory=list)
     signal_queue: List[SignalItem] = field(default_factory=list)
@@ -539,9 +574,15 @@ def build_engine_snapshot(bot, debug: bool = False) -> EngineSnapshot:
         # Calculate PnL
         pnl_abs, pnl_pct = calculate_position_pnl(position, current_price)
         
-        # Signal score
-        signal_score = float(position.get("signal_score", position.get("score", 0)) or 0)
-        if signal_score <= 1.0:
+        # Signal score - check multiple field names for compatibility
+        signal_score = float(
+            position.get("signal_score") or 
+            position.get("score") or 
+            position.get("final_score") or 
+            0
+        ) or 0
+        # If score is in 0-1 range (normalized), convert to 0-100 range
+        if signal_score > 0 and signal_score <= 1.0:
             signal_score = signal_score * 100.0
         
         # PRS
@@ -635,6 +676,47 @@ def build_engine_snapshot(bot, debug: bool = False) -> EngineSnapshot:
             except (TypeError, ValueError):
                 current_r = None
         
+        # ═══════════════════════════════════════════════════════════
+        # BINANCE MARKET DATA (First-hand exchange data)
+        # ═══════════════════════════════════════════════════════════
+        bid_price = None
+        ask_price = None
+        spread_bps = None
+        vol_24h_quote = None
+        pct_change_24h = None
+        
+        # Try to get market data from ticker cache
+        ticker_cache = getattr(bot, "ticker_cache", None)
+        if ticker_cache:
+            try:
+                ticker_data = ticker_cache.get(symbol, max_age=5.0)  # 5s max age
+                if ticker_data:
+                    bid_price = float(ticker_data.get("bid") or 0.0) or None
+                    ask_price = float(ticker_data.get("ask") or 0.0) or None
+                    vol_24h_quote = float(ticker_data.get("quoteVolume") or 0.0) or None
+                    pct_change_24h = float(ticker_data.get("percentage") or 0.0) or None
+            except Exception:
+                pass
+        
+        # Calculate spread in BPS if we have bid/ask
+        if bid_price and ask_price and bid_price > 0:
+            spread_bps = ((ask_price - bid_price) / bid_price) * 10000.0
+        
+        # Get stop loss and take profit prices
+        stop_loss_price = position.get("stop_loss")
+        if stop_loss_price:
+            try:
+                stop_loss_price = float(stop_loss_price)
+            except (TypeError, ValueError):
+                stop_loss_price = None
+        
+        take_profit_price = position.get("take_profit")
+        if take_profit_price:
+            try:
+                take_profit_price = float(take_profit_price) if float(take_profit_price) > 0 else None
+            except (TypeError, ValueError):
+                take_profit_price = None
+        
         open_positions.append(PositionSnapshot(
             symbol=symbol,
             side=side,
@@ -653,6 +735,13 @@ def build_engine_snapshot(bot, debug: bool = False) -> EngineSnapshot:
             dd_time=dd_time_str,
             is_unicorn=is_unicorn,
             current_r=current_r,
+            bid_price=bid_price,
+            ask_price=ask_price,
+            spread_bps=spread_bps,
+            vol_24h_quote=vol_24h_quote,
+            pct_change_24h=pct_change_24h,
+            stop_loss_price=stop_loss_price,
+            take_profit_price=take_profit_price,
         ))
     
     # Sort positions by importance
@@ -785,6 +874,67 @@ def build_engine_snapshot(bot, debug: bool = False) -> EngineSnapshot:
                 ))
     
     # ═══════════════════════════════════════════════════════════
+    # 7) ML FRAMEWORK STATUS
+    # ═══════════════════════════════════════════════════════════
+    
+    ml_framework_status = None
+    try:
+        from .ml.unified_framework import get_unified_ml_framework
+        framework = get_unified_ml_framework()
+        status = framework.get_status()
+        
+        # Get ML scorer details
+        scorer = framework.get_signal_scorer()
+        signal_scorer_loaded = status['signal_scorer']['loaded']
+        signal_scorer_error = status['signal_scorer']['error']
+        signal_scorer_predictions = getattr(scorer, 'prediction_count', 0)
+        signal_scorer_avg_time_ms = (
+            (getattr(scorer, 'total_prediction_time', 0.0) / signal_scorer_predictions * 1000.0)
+            if signal_scorer_predictions > 0 else 0.0
+        )
+        
+        # Get filter statistics from UnifiedFilter
+        filter_stats = {}
+        filter_pass_rate = 0.0
+        try:
+            position_manager = getattr(bot, 'position_manager', None)
+            if position_manager and hasattr(position_manager, 'unified_filter'):
+                unified_filter = position_manager.unified_filter
+                # Get filter stats from signal generator if available
+                signal_gen = getattr(bot, 'signal_generator', None)
+                if signal_gen and hasattr(signal_gen, '_filter_stats'):
+                    filter_stats = dict(signal_gen._filter_stats)
+                    total = filter_stats.get('accepted', 0) + filter_stats.get('rejected_hard_min', 0) + \
+                            filter_stats.get('rejected_percentile', 0) + filter_stats.get('rejected', 0)
+                    if total > 0:
+                        filter_pass_rate = (filter_stats.get('accepted', 0) / total * 100.0)
+        except Exception:
+            pass
+        
+        ml_framework_status = MLFrameworkStatus(
+            signal_scorer_loaded=signal_scorer_loaded,
+            signal_scorer_error=signal_scorer_error,
+            signal_scorer_predictions=signal_scorer_predictions,
+            signal_scorer_avg_time_ms=signal_scorer_avg_time_ms,
+            parameter_optimizer_available=status['parameter_optimizer']['available'],
+            evolution_learner_available=status['evolution_learner']['available'],
+            filter_stats=filter_stats,
+            filter_pass_rate=filter_pass_rate,
+        )
+    except Exception:
+        # ML framework not available - create empty status
+        ml_framework_status = MLFrameworkStatus(
+            signal_scorer_loaded=False,
+            signal_scorer_error="Framework not initialized",
+            signal_scorer_predictions=0,
+            signal_scorer_avg_time_ms=0.0,
+            parameter_optimizer_available=False,
+            evolution_learner_available=False,
+            filter_stats={},
+            filter_pass_rate=0.0,
+        )
+    
+    # ═══════════════════════════════════════════════════════════
     # BUILD SNAPSHOT
     # ═══════════════════════════════════════════════════════════
     
@@ -794,6 +944,7 @@ def build_engine_snapshot(bot, debug: bool = False) -> EngineSnapshot:
         performance=performance,
         signal_health=signal_health,
         risk=risk,
+        ml_framework=ml_framework_status,
         open_positions=open_positions,
         recent_activity=recent_activity,
         signal_queue=signal_queue,

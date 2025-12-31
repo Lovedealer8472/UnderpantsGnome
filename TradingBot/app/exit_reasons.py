@@ -33,6 +33,12 @@ class ExitReason(str, Enum):
     TRAILING_PARTIAL_2R = "trailing_partial_2r"
     
     # ────────────────────────────────────────────────────────────────
+    # EARLY PROTECTION / EMERGENCY EXITS
+    # ────────────────────────────────────────────────────────────────
+    EMERGENCY_EXIT_CATASTROPHIC_LOSS = "emergency_exit_catastrophic_loss"  # -5%+ loss during protection period
+    EARLY_PROTECTION_BLOCKED = "early_protection_blocked"  # For logging only
+    
+    # ────────────────────────────────────────────────────────────────
     # PRS (POSITION RECOVERY SCORE) EXITS
     # ────────────────────────────────────────────────────────────────
     PRS_FULL_EXIT = "prs_full_exit"  # Base reason (score appended in code)
@@ -48,6 +54,7 @@ class ExitReason(str, Enum):
     MAX_AGE_EXCEEDED = "max_age_exceeded"
     STALE_90MIN_EXIT = "stale_90min_exit"
     STALE_DRAWDOWN_RESUME = "stale_drawdown_resume"
+    STALE_ADOPTED_POSITION = "stale_adopted_position"  # Adopted position with no movement after 4+ hours
     
     # ────────────────────────────────────────────────────────────────
     # RISK MANAGEMENT EXITS

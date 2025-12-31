@@ -201,6 +201,11 @@ class KrakenExchange(ExchangeBase):
         if not self.exchange:
             return []
         try:
+            # Check if exchange has a valid connection (prevent NoneType errors)
+            if not hasattr(self.exchange, 'fetch_positions'):
+                self.logger.warning("Exchange object missing fetch_positions method")
+                return []
+            
             if params is None:
                 params = {}
             
@@ -210,8 +215,20 @@ class KrakenExchange(ExchangeBase):
             
             positions = await self.exchange.fetch_positions(exchange_symbols, params=params)
             return [p for p in positions if p.get("contracts", 0) != 0]
+        except AttributeError as e:
+            # Handle cases where exchange connection is None or broken
+            if "'NoneType'" in str(e) or "getaddrinfo" in str(e):
+                self.logger.warning(f"Exchange connection lost or invalid: {e}. Will retry on next sync.")
+            else:
+                self.logger.warning(f"Error fetching positions (AttributeError): {e}")
+            return []
         except Exception as e:
-            self.logger.warning(f"Error fetching positions: {e}")
+            # Handle network errors and other exceptions gracefully
+            error_str = str(e)
+            if "'NoneType'" in error_str or "getaddrinfo" in error_str or "connection" in error_str.lower():
+                self.logger.warning(f"Network error fetching positions: {e}. Exchange connection may be lost.")
+            else:
+                self.logger.warning(f"Error fetching positions: {e}")
             return []
     
     async def create_order(self, symbol: str, order_type: str, side: str,

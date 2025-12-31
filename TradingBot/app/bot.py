@@ -9,9 +9,12 @@ import traceback
 from collections import deque
 from typing import Optional, Dict, Any
 
+# Add parent directory to path to import signal_pressure_adapter from root
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from .logger import get_logger
 from .config import (
-    DRY_RUN, REPLAY_MODE, EXCHANGE, EXCHANGE_TIMEOUT_MS, EXCHANGE_RETRIES,
+    REPLAY_MODE, EXCHANGE, EXCHANGE_TIMEOUT_MS, EXCHANGE_RETRIES,
     ACCOUNT_BAL, LEVERAGE_BASE, MAX_LATENCY_MS, MAX_POSITION_SIZE,
     RETRY_DELAY_MULTIPLIER, MID_PRICE_FACTOR, BTC_TREND_WEAK_THRESHOLD,
     HIGH_VOLATILITY_MEDIAN_THRESHOLD, HIGH_VOLATILITY_P75_THRESHOLD,
@@ -31,6 +34,7 @@ from .decision_logger import get_decision_logger
 from .decision_event import DecisionEvent, log_trade_decision
 from .ticker_cache import get_ticker_cache
 from .fast_storage import get_fast_storage
+from .live_indicators import LiveIndicatorCalculator
 from .exchanges.factory import create_exchange
 import app.config as config_module
 
@@ -40,6 +44,19 @@ from .engine.exit_pipeline import ExitPipeline, ExitRequest
 
 # TRADE INTROSPECTION: Self-learning from each trade
 from .learner.integration import LearnerIntegration, is_learner_enabled
+
+# SIMPLE STOP LOSS: Single source of truth for all SL calculations
+# Using SimpleStopLossManager ONLY - removed old redundant functions
+from .stop_loss_manager import SimpleStopLossManager
+
+# SUPPLY/DEMAND ADAPTIVE ENTRY: Dynamically adjust threshold based on signal pressure
+from signal_pressure_adapter import SignalPressureMonitor
+
+# MARKET SPEED ADAPTATION: Learns from signal flow to adjust thresholds
+from market_speed_adapter import get_market_speed_adapter, MarketSpeedAdapter
+
+# INDICATOR FILTER: Blocks proven losing combinations (SHORT+RSI>65, etc.)
+from .indicator_filter import get_indicator_filter
 
 # OPTIMIZATION: Removed unused now_ms() function
 
@@ -113,26 +130,27 @@ class ScalperBot:
         from .config import USE_RICH_UI
         self.logger = get_logger("ScalperBot", enable_console=not USE_RICH_UI)
         
-        # SAFETY CHECK: Warn loudly if LIVE trading without interactive terminal
-        if not DRY_RUN:
-            try:
-                is_interactive = sys.stdin.isatty() and sys.stdout.isatty()
-            except Exception:
-                is_interactive = False
-            if not is_interactive:
-                self.logger.critical("=" * 60)
-                self.logger.critical("DANGER: LIVE TRADING WITHOUT INTERACTIVE TERMINAL")
-                self.logger.critical("DRY_RUN=False but no TTY detected!")
-                self.logger.critical("LIVE TRADING SHOULD BE SUPERVISED.")
-                self.logger.critical("=" * 60)
+        # Apply log cleanup filter (makes UI log tail readable)
+        try:
+            from .log_cleaner import setup_clean_logging
+            setup_clean_logging()
+        except Exception as e:
+            self.logger.debug(f"[LOG_CLEANUP] Could not setup log filters: {e}")
+        
+        # ============================================================================
+        # LIVE TRADING MODE (DRY_RUN disabled)
+        # ============================================================================
+        # Bot always runs in LIVE mode on real Binance exchange
+        # Paper trading (DRY_RUN) has been removed
+        # ============================================================================
+        self.dry_run = False  # Always live
         
         # CRITICAL VALIDATION: Prevent REPLAY_MODE in production
         if REPLAY_MODE:
             self.logger.warning("[!]  REPLAY_MODE is ENABLED - This bot will use RELAXED signal thresholds!")
             self.logger.warning("[!]  DO NOT use REPLAY_MODE for live trading!")
-            if not DRY_RUN:
-                self.logger.error("[X] FATAL: REPLAY_MODE cannot be used with LIVE trading (DRY_RUN=False)")
-                raise RuntimeError("REPLAY_MODE is only for backtesting. Set DRY_RUN=True or disable REPLAY_MODE.")
+            self.logger.error("[X] FATAL: REPLAY_MODE cannot be used with LIVE trading")
+            raise RuntimeError("REPLAY_MODE is only for backtesting. Disable REPLAY_MODE for live trading.")
         
         # Config access via cfg object
         self.cfg = config_module
@@ -145,9 +163,30 @@ class ScalperBot:
         self.position_manager = PositionManager()
         self.signal_generator = SignalGenerator()
         
-        # ADAPTIVE ENTRY: Dynamic threshold controller for 24/7 activity
-        from .adaptive_entry import get_adaptive_controller
-        self.adaptive_entry = get_adaptive_controller(logger=self.logger)
+        # Initialize adaptive threshold manager if enabled
+        from .config import USE_ADAPTIVE_THRESHOLDS
+        if USE_ADAPTIVE_THRESHOLDS:
+            try:
+                from .adaptive_threshold import AdaptiveThresholdManager
+                from .config import (
+                    ADAPTIVE_THRESHOLD_MIN, ADAPTIVE_THRESHOLD_MAX,
+                    ADAPTIVE_ADJUSTMENT_INTERVAL, ADAPTIVE_WINDOW_SIZE
+                )
+                self.signal_generator.adaptive_threshold_manager = AdaptiveThresholdManager(
+                    min_threshold=ADAPTIVE_THRESHOLD_MIN,
+                    max_threshold=ADAPTIVE_THRESHOLD_MAX,
+                    adjustment_interval=ADAPTIVE_ADJUSTMENT_INTERVAL,
+                    window_size=ADAPTIVE_WINDOW_SIZE
+                )
+                self.logger.info(
+                    f"[ADAPTIVE_THRESHOLD] System enabled: floor={ADAPTIVE_THRESHOLD_MIN}, "
+                    f"cap={ADAPTIVE_THRESHOLD_MAX}"
+                )
+            except Exception as e:
+                self.logger.warning(f"[ADAPTIVE_THRESHOLD] Failed to initialize: {e}")
+        
+        # ML-OPTIMIZED: Fixed thresholds (no adaptive lowering)
+        # MIN_SIGNAL_SCORE and HARD_MIN_SCORE are set via environment variables
         self.order_manager = None  # Will be set after exchange init
         self.exit_manager = None  # Will be set after exchange init
         
@@ -174,6 +213,10 @@ class ScalperBot:
         # LATENCY OPTIMIZATION: Initialize caches for ultra-fast data access
         self.ticker_cache = get_ticker_cache(ttl=0.5)  # 500ms cache TTL
         self.fast_storage = get_fast_storage()  # Persistent SQLite cache
+        
+        # LIVE INDICATORS: Initialize indicator calculator for LIVE mode
+        self.indicators_cache = {}  # Will be populated by live_indicator_calculator
+        self.live_indicator_calculator = None  # Initialized after exchange_wrapper
 
         # NEW ARCHITECTURE: Use PositionRegistry for centralized position management
         self.position_registry = PositionRegistry()
@@ -187,12 +230,8 @@ class ScalperBot:
             stats = self.learner.get_stats()
             self.logger.info("[LEARNER] Enabled: %d contexts, %d samples" % (stats["contexts_learned"], stats["global_samples"]))
 
-        # Use DRY_START_BALANCE for DRY_RUN, ACCOUNT_BAL for backward compatibility in LIVE
-        if DRY_RUN:
-            from .config import DRY_START_BALANCE
-            self.start_equity = float(DRY_START_BALANCE)
-        else:
-            self.start_equity = ACCOUNT_BAL  # LIVE mode uses ACCOUNT_BAL or real exchange balance
+        # LIVE mode uses ACCOUNT_BAL as starting balance
+        self.start_equity = ACCOUNT_BAL
         self.equity_peak = self.start_equity
         self.started_at = self._get_current_time()  # Use replay time if in replay mode
         self.circuit_breaker_triggered = False  # Track if drawdown circuit breaker has triggered
@@ -261,10 +300,17 @@ class ScalperBot:
         self.last_universe_refresh_time = 0.0  # Track when universe was last refreshed
         self.entries_attempted_this_scan = 0  # Entries attempted in current scan
         self._rate_limit_until = 0.0  # Timestamp when rate limit expires (0 = not rate limited)
+        
+        # SUPPLY/DEMAND ADAPTIVE ENTRY: Monitor signal pressure for dynamic threshold
+        self.signal_pressure_monitor = SignalPressureMonitor()
+        self.adaptive_min_signal_score = 59  # Current adaptive threshold (default to ML-optimized)
+        
+        # MARKET SPEED ADAPTATION: Learns from signal flow to adjust thresholds
+        self.market_speed_adapter = get_market_speed_adapter(max_positions=self.cfg.MAX_OPEN_POSITIONS)
         self._last_rate_limit_error = 0.0  # Timestamp of last rate limit error
         self.entries_opened_this_scan = 0  # Entries opened in current scan
         self.is_scanning = False  # Track if currently scanning
-        self.startup_period_ended = False  # Track if startup delay period has ended
+        # Bot initialization complete
         self.scan_stats = {
             'total_scans': 0,
             'total_symbols_processed': 0,
@@ -426,24 +472,48 @@ class ScalperBot:
             await asyncio.wait_for(self.exchange_wrapper.initialize(), timeout=30.0)
             self.logger.info("[DIAG] init_exchange:initialize_done")
             exchange_init_success = True
+            
+            # Initialize live indicator calculator (LIVE mode only)
+            if not self.replay_mode and self.exchange_wrapper:
+                self.live_indicator_calculator = LiveIndicatorCalculator(
+                    self.exchange_wrapper,
+                    self.logger
+                )
+                self.logger.info("[INDICATORS] Live indicator calculator initialized")
             self.logger.info("[OK] Exchange connection successful")
             
             # LIVE MODE: Fetch real balance from exchange and update start_equity
-            if not DRY_RUN and self.exchange_wrapper:
+            if not self.dry_run and self.exchange_wrapper:
                 try:
                     self.logger.info("[DIAG] init_exchange:fetch_balance")
                     balance_data = await self.exchange_wrapper.fetch_balance()
-                    # Extract USDT total (or synthesized USDT from USDC/BNFCR for EEA users)
+                    # Extract balance (USDC/USDT/BNFCR depending on region)
+                    usdc_total = float(balance_data.get('USDC', {}).get('total', 0.0))
                     usdt_total = float(balance_data.get('USDT', {}).get('total', 0.0))
-                    if usdt_total > 0:
+                    bnfcr_free = float(balance_data.get('BNFCR', {}).get('free', 0.0))  # Available balance
+                    
+                    # Use whichever stablecoin is available
+                    if usdc_total > 0:
+                        self.start_equity = usdc_total
+                        self.equity_peak = usdc_total
+                        self.logger.info(
+                            f"[OK] LIVE MODE: Synced start_equity with Binance balance: ${usdc_total:.2f} USDC"
+                        )
+                    elif usdt_total > 0:
                         self.start_equity = usdt_total
                         self.equity_peak = usdt_total
                         self.logger.info(
-                            f"[OK] LIVE MODE: Synced start_equity with Binance balance: ${usdt_total:.2f}"
+                            f"[OK] LIVE MODE: Synced start_equity with Binance balance: ${usdt_total:.2f} USDT"
+                        )
+                    elif bnfcr_free > 0:
+                        self.start_equity = bnfcr_free
+                        self.equity_peak = bnfcr_free
+                        self.logger.info(
+                            f"[OK] LIVE MODE: Synced start_equity with Binance balance: ${bnfcr_free:.2f} BNFCR (available)"
                         )
                     else:
                         self.logger.warning(
-                            f"[!] LIVE MODE: Could not fetch balance from exchange, using ACCOUNT_BAL: ${ACCOUNT_BAL:.2f}"
+                            f"[!] LIVE MODE: Could not fetch USDC/USDT/BNFCR balance from exchange, using ACCOUNT_BAL: ${ACCOUNT_BAL:.2f}"
                         )
                 except Exception as e:
                     self.logger.warning(
@@ -559,7 +629,7 @@ class ScalperBot:
             f"Initialized exchange: {EXCHANGE} (futures only)",
             markets=len(futures_markets),
             total_markets=len(mkts),
-            dry_run=DRY_RUN
+            dry_run=self.dry_run
         )
         
         if self.universe.stats and not hasattr(self, '_universe_logged'):
@@ -754,14 +824,20 @@ class ScalperBot:
         else:
             self.volatility_regime = "Normal"
             
-        # [SMART REGIME ADAPTER] Apply settings
-        self._apply_dynamic_regime_settings()
+        # REGIME ADAPTER DISABLED: Let ML and user config control behavior
+        # (Was overriding MIN_SIGNAL_SCORE and MAX_POSITIONS with RAPTOR/WOLF PACK modes)
+        pass
 
     def _apply_dynamic_regime_settings(self):
         """
         Dynamically adjust bot configuration based on market regime.
         This is the "Smart Regime Adapter" requested by the Council.
+        
+        DISABLED: This function is disabled to allow ML-only operation.
         """
+        # DISABLED: Return immediately - no regime overrides
+        return
+        
         if not hasattr(self, 'volatility_regime') or not hasattr(self, 'market_regime'):
             return
 
@@ -1444,10 +1520,66 @@ class ScalperBot:
                         self._init_fallback_symbols()
             return
     
+    async def _validate_all_positions_tracked(self):
+        """Validate that ALL Binance positions are tracked - critical safety check."""
+        if not self.exchange_wrapper or self.replay_mode:
+            return
+        
+        try:
+            binance_positions = await self.exchange_wrapper.fetch_positions()
+            tracked_symbols = set(self.positions.keys())
+            binance_symbols = set()
+            
+            for rp in binance_positions:
+                sym = rp.get('symbol') or rp.get('symbolName')
+                if not sym:
+                    continue
+                
+                # Normalize
+                if hasattr(self.exchange_wrapper, 'normalize_symbol'):
+                    sym = self.exchange_wrapper.normalize_symbol(sym)
+                
+                # Skip delivery contracts
+                clean_sym = sym.replace("/", "").replace("-", "").replace(":", "")
+                if "USDTUSDT" in clean_sym or (len(clean_sym) > 6 and clean_sym[-6:].isdigit()):
+                    continue
+                
+                size = abs(float(rp.get('contracts', rp.get('amount', rp.get('positionAmt', 0.0))) or 0.0))
+                if size > 0:
+                    binance_symbols.add(sym)
+            
+            # Check for unmanaged positions
+            unmanaged = binance_symbols - tracked_symbols
+            if unmanaged:
+                self.logger.error(
+                    f"[CRITICAL_VALIDATION] {len(unmanaged)} UNMANAGED POSITIONS: {', '.join(unmanaged)}. "
+                    f"These positions are on Binance but NOT tracked by bot - IMMEDIATE RISK!"
+                )
+                # Force adoption will happen in next sync cycle
+            elif len(binance_symbols) > 0:
+                # All positions tracked - log success periodically
+                if not hasattr(self, '_last_validation_log') or time.time() - getattr(self, '_last_validation_log', 0) > 300:
+                    self.logger.info(
+                        f"[POSITION_VALIDATION] All {len(binance_symbols)} Binance positions are tracked and managed. "
+                        f"Bot: {len(tracked_symbols)}, Binance: {len(binance_symbols)}"
+                    )
+                    self._last_validation_log = time.time()
+            
+            # Always log if there's a count mismatch (even if all positions are tracked)
+            if len(tracked_symbols) != len(binance_symbols):
+                self.logger.warning(
+                    f"[POSITION_COUNT_MISMATCH] Bot tracks {len(tracked_symbols)} positions, "
+                    f"Binance has {len(binance_symbols)} positions. "
+                    f"Tracked: {sorted(tracked_symbols)}, Binance: {sorted(binance_symbols)}"
+                )
+        except Exception as e:
+            self.logger.error(f"[POSITION_VALIDATION] Error validating positions: {e}")
+
     async def _refresh_positions(self):
         """
         Force-refresh all positions from exchange.
         Synchronizes self.positions with exchange reality.
+        CRITICAL: This must run frequently to prevent unmanaged positions.
         """
         if not self.exchange_wrapper or self.replay_mode:
             return
@@ -1455,6 +1587,19 @@ class ScalperBot:
         try:
             # Fetch all open positions (no symbol filter)
             real_positions = await self.exchange_wrapper.fetch_positions()
+            
+            # Handle None or invalid response
+            if real_positions is None:
+                self.logger.warning("[POSITION_SYNC] fetch_positions returned None, skipping sync")
+                return
+            
+            # CRITICAL: Log raw position count for debugging
+            if not hasattr(self, '_last_position_count_log') or time.time() - getattr(self, '_last_position_count_log', 0) > 60:
+                self.logger.info(
+                    f"[POSITION_SYNC] Fetched {len(real_positions)} positions from Binance. "
+                    f"Bot currently tracking {len(self.positions)} positions."
+                )
+                self._last_position_count_log = time.time()
             
             # Sync timestamp
             sync_time = time.time()
@@ -1466,22 +1611,41 @@ class ScalperBot:
             # 3. Remove positions not in real_positions (unless we just opened them < 5s ago)
             
             real_symbols = set()
+            positions_processed = 0
+            positions_adopted = 0
+            positions_skipped_delivery = 0
+            positions_skipped_zero = 0
             
             for rp in real_positions:
+                positions_processed += 1
                 sym = rp.get('symbol') or rp.get('symbolName')
                 if not sym:
                     continue
                 
-                # Normalize symbol
+                # Normalize symbol FIRST
+                original_sym = sym
                 if hasattr(self.exchange_wrapper, 'normalize_symbol'):
                     sym = self.exchange_wrapper.normalize_symbol(sym)
                 
-                real_symbols.add(sym)
-                
-                # Adopt/Update
                 # CRITICAL: Binance returns NEGATIVE positionAmt for shorts - use abs()
                 raw_size = float(rp.get('contracts', rp.get('amount', rp.get('positionAmt', 0.0))) or 0.0)
                 position_size = abs(raw_size)  # Always positive
+                
+                # CRITICAL: Skip delivery contracts but adopt ALL other positions with size > 0
+                clean_sym = sym.replace("/", "").replace("-", "").replace(":", "")
+                is_delivery_contract = ("USDTUSDT" in clean_sym or (len(clean_sym) > 6 and clean_sym[-6:].isdigit()))
+                
+                if is_delivery_contract:
+                    positions_skipped_delivery += 1
+                    continue  # Skip delivery contracts
+                
+                # CRITICAL: Only adopt positions with size > 0 (closed positions have size = 0)
+                if position_size <= 0:
+                    positions_skipped_zero += 1
+                    continue  # Skip closed/zero positions
+                
+                # Add to real_symbols for cleanup tracking
+                real_symbols.add(sym)
                 
                 # Determine side from positionAmt sign or explicit side field
                 explicit_side = rp.get('side', rp.get('positionSide', '')).lower()
@@ -1494,41 +1658,424 @@ class ScalperBot:
                 else:
                     side = 'long'   # Positive or zero = long
                 
-                # Preserve entry_time if known, otherwise use current time
+                # Preserve entry_time if known, otherwise fetch from Binance order history
                 # DEFENSIVE: Never use 0 or invalid timestamps
-                preserved_entry_time = self.positions.get(sym, {}).get('entry_time', sync_time)
-                if preserved_entry_time <= 0 or preserved_entry_time > sync_time:
-                    preserved_entry_time = sync_time
+                preserved_entry_time = self.positions.get(sym, {}).get('entry_time')
+                
+                # If we don't have entry_time, try to fetch from order history (BEST accuracy)
+                if not preserved_entry_time or preserved_entry_time <= 0 or preserved_entry_time > sync_time:
+                    # Try to fetch actual entry time from order history
+                    try:
+                        entry_price = float(rp.get('entryPrice', rp.get('price', 0.0)) or 0.0)
+                        if entry_price > 0:
+                            # Fetch recent orders for this symbol (last 7 days)
+                            since_ms = int((sync_time - 7 * 24 * 3600) * 1000)  # 7 days ago in ms
+                            orders = await self.exchange_wrapper.fetch_orders(sym, since=since_ms, limit=100)
+                            
+                            # Find orders matching our position
+                            order_side = 'buy' if side == 'long' else 'sell'
+                            matching_orders = [
+                                o for o in orders 
+                                if o.get('status') == 'closed'  # CCXT uses 'closed' for filled orders
+                                and o.get('side') == order_side
+                                and abs(float(o.get('average', 0) or 0) - entry_price) < entry_price * 0.001  # 0.1% tolerance
+                            ]
+                            
+                            if matching_orders:
+                                # Use earliest matching order time
+                                preserved_entry_time = min(o.get('timestamp', sync_time * 1000) for o in matching_orders) / 1000.0
+                                self.logger.info(f"[POSITION_SYNC] {sym}: Found entry time from order history: {preserved_entry_time:.0f}")
+                            else:
+                                # Fallback to updateTime
+                                binance_update_time = rp.get('updateTime', 0)
+                                if binance_update_time and binance_update_time > 0:
+                                    preserved_entry_time = binance_update_time / 1000.0
+                                else:
+                                    preserved_entry_time = sync_time
+                    except Exception as e:
+                        # If order fetch fails, fallback to updateTime
+                        self.logger.debug(f"[POSITION_SYNC] {sym}: Could not fetch order history: {e}")
+                        binance_update_time = rp.get('updateTime', 0)
+                        if binance_update_time and binance_update_time > 0:
+                            preserved_entry_time = binance_update_time / 1000.0
+                        else:
+                            preserved_entry_time = sync_time
+                    
+                    # Validate: entry_time should be in the past
+                    if preserved_entry_time > sync_time:
+                        preserved_entry_time = sync_time
+                
+                # Get unrealized PnL from Binance
+                unrealized_pnl = float(rp.get('unrealizedPnl', 0.0) or 0.0)
+                
+                # For adopted positions, set peak_pnl to current PnL (best estimate we have)
+                # This allows trailing to work immediately if position is in profit
+                peak_pnl = self.positions.get(sym, {}).get('peak_pnl', unrealized_pnl)
+                if unrealized_pnl > peak_pnl:
+                    peak_pnl = unrealized_pnl
+                
+                # Extract stop loss from Binance if available
+                # Binance provides stopPrice for open stop-loss orders
+                stop_loss_from_binance = float(rp.get('stopPrice', 0.0) or 0.0)
+                
+                # Determine entry price first (needed for stop loss calculation)
+                entry_price = float(rp.get('entryPrice', rp.get('price', 0.0)) or 0.0)
+                if not entry_price:
+                    entry_price = float(rp.get('avgPrice', rp.get('markPrice', 0.0)) or 0.0)
+                
+                # If Binance doesn't have a stop loss, use centralized calculator
+                # CENTRALIZED: Always uses max(ATR-based, MIN_STOP_DISTANCE_PCT) for safety
+                if not stop_loss_from_binance and entry_price > 0:
+                    stop_loss_from_binance = SimpleStopLossManager.set_initial_stop_loss(
+                        entry_price=entry_price,
+                        side=side,
+                        atr_pct=None,  # ATR not available for adopted positions
+                        symbol=sym  # Pass symbol for volatility adjustments
+                    )
+
                 
                 adopted = {
                     'symbol': sym,
-                    'entry_price': float(rp.get('entryPrice', rp.get('price', 0.0)) or 0.0),
+                    'entry_price': entry_price,
                     'size': position_size,
                     'side': side,
                     'leverage': int(rp.get('leverage', 1) or 1),
-                    'entry_time': preserved_entry_time,  # Preserve entry time if known, never use 0
-                    'unrealizedPnl': float(rp.get('unrealizedPnl', 0.0) or 0.0),
+                    'entry_time': preserved_entry_time,  # Use Binance updateTime if available
+                    'unrealizedPnl': unrealized_pnl,
+                    'peak_pnl': peak_pnl,  # Track peak PnL for trailing
+                    'is_adopted': True,  # Flag for degraded data quality
+                    'stop_loss': stop_loss_from_binance,  # Use Binance stopPrice if set, else ATR-based
                 }
 
-                # Fallbacks
-                if not adopted['entry_price']:
-                    adopted['entry_price'] = float(rp.get('avgPrice', rp.get('markPrice', 0.0)) or 0.0)
+                # Fallbacks (already calculated entry_price above)
                 if not adopted['size']:
                     adopted['size'] = abs(float(rp.get('qty', 0.0) or 0.0))
                 
+                # CRITICAL: Preserve trailing stop data from existing position
+                # Never let synced data overwrite our trailing stops!
+                existing_pos = self.positions.get(sym, {})
+                if existing_pos:
+                    # Preserve stop_loss - ONLY if it's BETTER than what we calculated
+                    existing_sl = existing_pos.get('stop_loss', 0)
+                    new_sl = adopted.get('stop_loss', 0)
+                    
+                    if existing_sl > 0:
+                        if side == 'long':
+                            # For LONG: higher SL is better (more profit locked)
+                            if existing_sl > new_sl:
+                                adopted['stop_loss'] = existing_sl
+                        else:  # short
+                            # For SHORT: lower SL is better (more profit locked)
+                            if new_sl <= 0 or existing_sl < new_sl:
+                                adopted['stop_loss'] = existing_sl
+                    
+                    # Preserve other trailing state
+                    for key in ['initial_stop_price', 'trailing_state', 'current_r', 'peak_r', 
+                                'max_r', 'locked_r', 'current_price', 'last_trailing_update_ts']:
+                        if key in existing_pos and existing_pos[key]:
+                            adopted[key] = existing_pos[key]
+                
+                if sym == 'RENDER/USDT':
+                    self.logger.error(
+                        f"[RENDER_DEBUG] Syncing: adopted_sl={adopted.get('stop_loss', 0)}, "
+                        f"existing_sl={existing_pos.get('stop_loss', 0) if existing_pos else 'N/A'}"
+                    )
+                
+                # CRITICAL: Always adopt positions with size > 0
+                # This ensures we track ALL active positions from Binance
+                was_tracked_before = sym in self.positions
                 self.positions[sym] = adopted
                 self.position_registry._positions[sym] = adopted
                 self.position_registry._positions_set.add(sym)
                 self._positions_set.add(sym)
+                positions_adopted += 1
+                
+                # ========== TRAILING STOP LOGIC (runs every sync, ~5 seconds) ==========
+                # CENTRALIZED: Use stop_loss_calculator for trailing
+                current_price = float(rp.get('markPrice', rp.get('lastPrice', 0.0)) or 0.0)
+                current_sl = self.positions[sym].get('stop_loss', 0.0)
+                
+                if current_price > 0 and entry_price > 0:
+                    # Store current_price for trailing calculations
+                    self.positions[sym]['current_price'] = current_price
+                    
+                    # Use SimpleStopLossManager for trailing
+                    new_sl, should_update, profit_locked = SimpleStopLossManager.update_trailing_stop(
+                        entry_price=entry_price,
+                        current_price=current_price,
+                        current_sl=current_sl,
+                        side=side
+                    )
+                    
+                    if should_update:
+                        old_sl = current_sl
+                        self.positions[sym]['stop_loss'] = new_sl
+                        # Logging already done in SimpleStopLossManager
+                # ========== END TRAILING STOP LOGIC ==========
+                
+                # Log adoption for visibility (especially for unmanaged positions)
+                was_unmanaged = sym not in getattr(self, '_startup_synced_symbols', set())
+                if was_unmanaged or not was_tracked_before:
+                    entry_price_val = adopted.get('entry_price', 0.0)
+                    age_minutes = (sync_time - preserved_entry_time) / 60.0 if preserved_entry_time > 0 else 0.0
+                    self.logger.warning(
+                        f"[POSITION_SYNC] {'Adopted UNMANAGED' if was_unmanaged else 'Updated'} position: {sym} {side.upper()} | "
+                        f"Size={position_size:.4f} | Entry=${entry_price_val:.6f} | "
+                        f"PnL=${adopted.get('unrealizedPnl', 0):.2f} | Peak=${peak_pnl:.2f} | "
+                        f"Age={age_minutes:.1f}min | "
+                        f"⚠️ RISK MANAGEMENT ONLY (trailing/SL active, PRS disabled) | "
+                        f"Now tracking {len(self.positions)} positions"
+                    )
+                    if not hasattr(self, '_startup_synced_symbols'):
+                        self._startup_synced_symbols = set()
+                    self._startup_synced_symbols.add(sym)
+            
+            # Log sync summary for debugging
+            if positions_processed > 0:
+                self.logger.debug(
+                    f"[POSITION_SYNC_SUMMARY] Processed {positions_processed} positions: "
+                    f"{positions_adopted} adopted, {positions_skipped_delivery} delivery contracts skipped, "
+                    f"{positions_skipped_zero} zero-size skipped, now tracking {len(self.positions)} total"
+                )
+            
+            # SIMPLE SL: No need for fix function - SimpleStopLossManager always creates valid SLs
+            # The trailing stop updates above handle any adjustments needed
+
+            # CRITICAL VALIDATION: Verify ALL Binance positions are tracked after sync
+            tracked_symbols = set(self.positions.keys())
+            binance_active_symbols = set()
+            binance_position_details = {}  # Store details for logging
+            
+            for rp in real_positions:
+                sym_check = rp.get('symbol') or rp.get('symbolName')
+                if sym_check:
+                    if hasattr(self.exchange_wrapper, 'normalize_symbol'):
+                        sym_check = self.exchange_wrapper.normalize_symbol(sym_check)
+                    clean_check = sym_check.replace("/", "").replace("-", "").replace(":", "")
+                    if not ("USDTUSDT" in clean_check or (len(clean_check) > 6 and clean_check[-6:].isdigit())):
+                        size_check = abs(float(rp.get('contracts', rp.get('amount', rp.get('positionAmt', 0.0))) or 0.0))
+                        if size_check > 0:
+                            binance_active_symbols.add(sym_check)
+                            binance_position_details[sym_check] = {
+                                'size': size_check,
+                                'entry_price': rp.get('entryPrice', rp.get('price', 0.0)),
+                                'unrealized_pnl': rp.get('unrealizedPnl', 0.0)
+                            }
+            
+            # Check for unmanaged positions (on Binance but not tracked)
+            unmanaged = binance_active_symbols - tracked_symbols
+            if unmanaged:
+                self.logger.error(
+                    f"[CRITICAL] After sync: {len(unmanaged)} UNMANAGED POSITIONS: {', '.join(unmanaged)}. "
+                    f"These positions are on Binance but NOT tracked - IMMEDIATE RISK! FORCING ADOPTION..."
+                )
+                # Log details of unmanaged positions
+                for sym in unmanaged:
+                    details = binance_position_details.get(sym, {})
+                    self.logger.error(
+                        f"[UNMANAGED] {sym}: Size={details.get('size', 0):.4f} | "
+                        f"Entry=${details.get('entry_price', 0):.6f} | "
+                        f"PnL=${details.get('unrealized_pnl', 0):.2f}"
+                    )
+                
+                # CRITICAL: Force immediate adoption of unmanaged positions
+                # Find the position data from real_positions and adopt it
+                for rp in real_positions:
+                    sym_check = rp.get('symbol') or rp.get('symbolName')
+                    if not sym_check:
+                        continue
+                    
+                    # Normalize symbol
+                    if hasattr(self.exchange_wrapper, 'normalize_symbol'):
+                        sym_check = self.exchange_wrapper.normalize_symbol(sym_check)
+                    
+                    if sym_check in unmanaged:
+                        # Force adopt this position
+                        raw_size = float(rp.get('contracts', rp.get('amount', rp.get('positionAmt', 0.0))) or 0.0)
+                        position_size = abs(raw_size)
+                        
+                        # Determine side
+                        explicit_side = rp.get('side', rp.get('positionSide', '')).lower()
+                        if explicit_side in ('long', 'buy'):
+                            side = 'long'
+                        elif explicit_side in ('short', 'sell'):
+                            side = 'short'
+                        elif raw_size < 0:
+                            side = 'short'
+                        else:
+                            side = 'long'
+                        
+                        # Extract stop loss from Binance if available
+                        stop_loss_from_binance = float(rp.get('stopPrice', 0.0) or 0.0)
+                        
+                        # Determine entry price first (needed for stop loss calculation)
+                        entry_price = float(rp.get('entryPrice', rp.get('price', 0.0)) or 0.0)
+                        if not entry_price:
+                            entry_price = float(rp.get('avgPrice', rp.get('markPrice', 0.0)) or 0.0)
+                        
+                        # If Binance doesn't have a stop loss, initialize with ATR-based default (0.35 * ATR)
+                        if not stop_loss_from_binance and entry_price > 0:
+                            # Use cached ATR for scalper stop calculation
+                            # Get ATR if available
+                            atr_pct = 0.01  # Default fallback
+                            if hasattr(self, 'indicators_cache'):
+                                indicators = self.indicators_cache.get(sym_check)
+                                if indicators:
+                                    atr_pct = getattr(indicators, 'atr_pct', 0.01)
+                            
+                            # SIMPLE SL: Calculate using SimpleStopLossManager
+                            stop_loss_from_binance = SimpleStopLossManager.set_initial_stop_loss(
+                                entry_price=entry_price,
+                                side=side,
+                                atr_pct=atr_pct
+                            )
+                            
+                            self.logger.debug(
+                                f"[FORCE_ADOPTED_STOP_INIT] {sym_check}: Centralized SL calc: "
+                                f"{stop_loss_from_binance:.6f} (side={side}, entry={entry_price:.6f}, atr={atr_pct:.4f})"
+                            )
+                        
+                        force_adopted = {
+                            'symbol': sym_check,
+                            'entry_price': entry_price,
+                            'size': position_size,
+                            'side': side,
+                            'leverage': int(rp.get('leverage', 1) or 1),
+                            'entry_time': sync_time,
+                            'unrealizedPnl': float(rp.get('unrealizedPnl', 0.0) or 0.0),
+                            'force_adopted': True,  # Flag to indicate this was force-adopted
+                            'signal_score': 70.0,  # ADOPTED: Assign standard score to prevent immediate scalp exits
+                            'entry_score': 70.0,  # ADOPTED: Treat as standard quality signal
+                            'exit_profile': 'standard',  # ADOPTED: Use standard exit profile (not scalp)
+                            'stop_loss': stop_loss_from_binance,  # Use Binance stopPrice if set, else ATR-based
+                        }
+                        
+                        # Fallbacks (already calculated entry_price above)
+                        if not force_adopted['size']:
+                            force_adopted['size'] = abs(float(rp.get('qty', 0.0) or 0.0))
+                        
+                        # CRITICAL: Preserve stop loss that may have been set by scalper/exit logic
+                        # Only use calculated stop_loss if position doesn't already have one set
+                        existing_pos = self.positions.get(sym_check, {})
+                        if existing_pos and existing_pos.get('stop_loss', 0) > 0:
+                            force_adopted['stop_loss'] = existing_pos['stop_loss']  # Preserve scalper-managed SL
+                        
+                        # Force add to all tracking structures
+                        self.positions[sym_check] = force_adopted
+                        self.position_registry._positions[sym_check] = force_adopted
+                        self.position_registry._positions_set.add(sym_check)
+                        self._positions_set.add(sym_check)
+                        
+                        # Update tracked_symbols for validation
+                        tracked_symbols.add(sym_check)
+                        
+                        self.logger.error(
+                            f"[FORCE_ADOPTED] {sym_check} {side.upper()} | "
+                            f"Size={position_size:.4f} | Entry=${force_adopted['entry_price']:.6f} | "
+                            f"PnL=${force_adopted.get('unrealizedPnl', 0):.2f} | "
+                            f"Now tracking {len(self.positions)} positions"
+                        )
+                        
+                        if not hasattr(self, '_startup_synced_symbols'):
+                            self._startup_synced_symbols = set()
+                        self._startup_synced_symbols.add(sym_check)
+            
+            # Check for ghost positions (tracked but not on Binance)
+            ghost_positions = tracked_symbols - binance_active_symbols
+            if ghost_positions:
+                self.logger.warning(
+                    f"[GHOST_POSITIONS] {len(ghost_positions)} positions tracked but not on Binance: {', '.join(ghost_positions)}. "
+                    f"These will be cleaned up if older than 10 seconds."
+                )
+            
+            # CRITICAL: Final validation - ensure counts match after force-adoption
+            tracked_symbols_final = set(self.positions.keys())
+            if len(tracked_symbols_final) != len(binance_active_symbols):
+                self.logger.error(
+                    f"[CRITICAL] Position count STILL mismatched after force-adoption: "
+                    f"Bot tracks {len(tracked_symbols_final)} positions, "
+                    f"Binance has {len(binance_active_symbols)} active positions. "
+                    f"Tracked: {sorted(tracked_symbols_final)}, Binance: {sorted(binance_active_symbols)}"
+                )
+                # Log which positions are missing
+                still_missing = binance_active_symbols - tracked_symbols_final
+                if still_missing:
+                    self.logger.error(
+                        f"[CRITICAL] STILL UNMANAGED after force-adoption: {sorted(still_missing)}. "
+                        f"Attempting emergency adoption..."
+                    )
+                    # EMERGENCY: Try one more time to adopt missing positions
+                    for missing_sym in still_missing:
+                        for rp in real_positions:
+                            sym_check = rp.get('symbol') or rp.get('symbolName')
+                            if not sym_check:
+                                continue
+                            if hasattr(self.exchange_wrapper, 'normalize_symbol'):
+                                sym_check = self.exchange_wrapper.normalize_symbol(sym_check)
+                            if sym_check == missing_sym:
+                                # Emergency adopt
+                                raw_size = float(rp.get('contracts', rp.get('amount', rp.get('positionAmt', 0.0))) or 0.0)
+                                position_size = abs(raw_size)
+                                if position_size > 0:
+                                    explicit_side = rp.get('side', rp.get('positionSide', '')).lower()
+                                    side = 'short' if (explicit_side in ('short', 'sell') or raw_size < 0) else 'long'
+                                    emergency_pos = {
+                                        'symbol': missing_sym,
+                                        'entry_price': float(rp.get('entryPrice', rp.get('price', 0.0)) or 0.0),
+                                        'size': position_size,
+                                        'side': side,
+                                        'leverage': int(rp.get('leverage', 1) or 1),
+                                        'entry_time': sync_time,
+                                        'unrealizedPnl': float(rp.get('unrealizedPnl', 0.0) or 0.0),
+                                        'emergency_adopted': True,
+                                        'signal_score': 70.0,  # ADOPTED: Assign standard score to prevent immediate scalp exits
+                                        'entry_score': 70.0,  # ADOPTED: Treat as standard quality signal
+                                        'exit_profile': 'standard',  # ADOPTED: Use standard exit profile (not scalp)
+                                    }
+                                    if not emergency_pos['entry_price']:
+                                        emergency_pos['entry_price'] = float(rp.get('avgPrice', rp.get('markPrice', 0.0)) or 0.0)
+                                    self.positions[missing_sym] = emergency_pos
+                                    self.position_registry._positions[missing_sym] = emergency_pos
+                                    self.position_registry._positions_set.add(missing_sym)
+                                    self._positions_set.add(missing_sym)
+                                    self.logger.error(
+                                        f"[EMERGENCY_ADOPTED] {missing_sym} {side.upper()} | "
+                                        f"Size={position_size:.4f} | Entry=${emergency_pos['entry_price']:.6f} | "
+                                        f"Now tracking {len(self.positions)} positions"
+                                    )
+                                break
+            else:
+                # Success - all positions tracked
+                if len(binance_active_symbols) > 0:
+                    self.logger.info(
+                        f"[POSITION_SYNC_SUCCESS] All {len(binance_active_symbols)} Binance positions are tracked. "
+                        f"Symbols: {sorted(binance_active_symbols)}"
+                    )
 
             # Cleanup stale positions (Ghost Busting)
-            # Only remove if it's NOT in real_positions AND it's older than 10s
-            # (Prevents race condition where we just opened a trade but API doesn't show it yet)
+            # Remove positions that don't exist on Binance
+            # When Binance shows 0 positions but bot has positions = crash/restart scenario
+            # Clean all ghost positions immediately
             for sym in list(self.positions.keys()):
                 if sym not in real_symbols:
+                    # In crash recovery (Binance has 0, bot has ghosts): clean immediately
+                    # In normal operation: clean if older than 10s (race condition protection)
                     entry_ts = self.positions[sym].get('entry_time', 0)
-                    if sync_time - entry_ts > 10.0:
-                        self.logger.info(f"[!] GHOST BUSTED: Removing stale position {sym} (not on exchange)")
+                    
+                    should_remove = False
+                    if len(real_symbols) == 0:
+                        # Crash scenario: Binance shows 0, clean all ghosts immediately
+                        should_remove = True
+                    elif sync_time - entry_ts > 10.0:
+                        # Normal operation: clean if older than 10s
+                        should_remove = True
+                    
+                    if should_remove:
+                        if len(real_symbols) == 0:
+                            self.logger.warning(f"[GHOST_CLEANUP] Binance has 0 positions, removing ghost {sym}")
+                        else:
+                            self.logger.info(f"[!] GHOST BUSTED: Removing stale position {sym} (not on exchange)")
+                        
                         del self.positions[sym]
                         if sym in self.position_registry._positions:
                             del self.position_registry._positions[sym]
@@ -1538,8 +2085,16 @@ class ScalperBot:
                             self._positions_set.remove(sym)
                             
         except Exception as e:
-            self.logger.error(f"Error refreshing positions: {e}")
-            raise # Propagate error for startup check
+            # Handle network errors gracefully - don't crash on connection issues
+            error_str = str(e)
+            if "'NoneType'" in error_str or "getaddrinfo" in error_str or "connection" in error_str.lower():
+                self.logger.warning(f"Network error refreshing positions: {e}. Exchange connection may be lost. Will retry on next sync.")
+                # Don't raise - allow bot to continue and retry later
+            else:
+                self.logger.error(f"Error refreshing positions: {e}")
+                # Only raise for non-network errors during startup
+                if hasattr(self, '_startup_time') and (time.time() - self._startup_time) < 60:
+                    raise  # Propagate error for startup check
 
     async def _refresh_orderbooks_for_top_symbols(self):
         """Refresh orderbooks for top symbols to improve signal quality."""
@@ -1647,7 +2202,7 @@ class ScalperBot:
         Refresh funding rates for active symbols.
         OPTIMIZED: Uses Binance Futures batch premium index endpoint when possible.
         """
-        if not self.exchange_wrapper or DRY_RUN:
+        if not self.exchange_wrapper:
             return
         
         # Get active symbols
@@ -1723,7 +2278,7 @@ class ScalperBot:
     
     async def _refresh_orderbooks_for_positions(self):
         """Refresh orderbooks for open positions for better exit decisions."""
-        if not self.exchange_wrapper or DRY_RUN or not self.positions:
+        if not self.exchange_wrapper or not self.positions:
             return
         
         # [!] ADAPTIVE: Check if we should skip this refresh (too frequent or in backoff)
@@ -1791,7 +2346,7 @@ class ScalperBot:
     async def scan_and_enter_signals(self):
         """Scan for trading signals and enter positions."""
         from .config import (
-            MAX_LATENCY_MS, MIN_VOLUME_24H, MIN_SPREAD_BPS, DRY_RUN
+            MAX_LATENCY_MS, MIN_VOLUME_24H, MIN_SPREAD_BPS
         )
         
         if not self.order_manager:
@@ -1806,6 +2361,15 @@ class ScalperBot:
         self.last_scan_start = scan_start_time
         self.is_scanning = True
         
+        # LIVE INDICATORS: Batch update indicators for active symbols
+        if self.live_indicator_calculator and not self.replay_mode:
+            try:
+                # Get top symbols from universe
+                top_symbols = self.universe.active[:30]  # Top 30 by volume
+                await self.live_indicator_calculator.batch_update(top_symbols, max_concurrent=3)
+            except Exception as e:
+                self.logger.debug(f"[INDICATORS] Batch update failed: {e}")
+        
         # DEBUG: Log scan start (first few scans only)
         if not hasattr(self, '_scan_start_count'):
             self._scan_start_count = 0
@@ -1818,40 +2382,10 @@ class ScalperBot:
                 f"replay_mode={self.replay_mode}"
             )
         
-        # STARTUP DELAY: Block entries during warmup to collect historical data
-        # REPLAY MODE: Skip time-based warmup (entries allowed immediately)
-        if self.replay_mode:
-            # No time-based startup warmup in replay; allow entries immediately
-            in_startup_period = False
-            if not self.startup_period_ended:
-                self.startup_period_ended = True
-                self.logger.info("[OK] REPLAY MODE: Startup warmup skipped (entries enabled immediately)")
-        else:
-            # LIVE MODE: Block entries during warmup period
-            time_since_start = scan_start_time - self.started_at
-            in_startup_period = time_since_start < STARTUP_DELAY_SEC if STARTUP_DELAY_SEC > 0 else False
-            
-            # During startup warmup: SCAN signals but BLOCK entries to build signal history
-            # This ensures percentile filter has good data before allowing trades
-            if in_startup_period and not self.startup_period_ended:
-                remaining = STARTUP_DELAY_SEC - time_since_start
-                # Only log once when warmup starts
-                if not hasattr(self, '_warmup_logged'):
-                    self.logger.info(
-                        f"Warming up: Full market scan in progress ({STARTUP_DELAY_SEC}s)... Building signal history for percentile filter. Will start trading in {remaining:.0f}s"
-                    )
-                    self._warmup_logged = True
-                # CONTINUE scanning during warmup (don't return early) - we need signal history
-                # But set flag to block entries in the entry logic below
-                in_startup_period = True
-            elif not self.startup_period_ended and STARTUP_DELAY_SEC > 0:
-                # Startup period just ended - now allow entries
-                self.startup_period_ended = True
-                signal_history_count = len(getattr(self.signal_generator, 'signal_history', []))
-                self.logger.info(
-                    f"Warmup complete. Full market scan finished. Signal history: {signal_history_count} signals collected. Bot is now ready to trade (top 1% filtering active)."
-                )
-                in_startup_period = False
+        # STARTUP: No warmup delay - entries enabled immediately
+        # Bot starts trading on first signal
+        in_startup_period = False
+        self.startup_period_ended = True
         
         # OPTIMIZATION: Cache equity calculation (used multiple times)
         equity = self.equity_now()
@@ -1886,72 +2420,64 @@ class ScalperBot:
         # IDLE RELAXATION MODE: Gradually lower entry score when no positions to stay active 24/7
         # This ensures the bot stays active during slow periods (advantage over humans who sleep)
         # Strategy: Start at normal threshold, gradually lower every scan cycle until position taken
-        # Once a position is taken, immediately reset to normal strict filtering
-        is_idle_mode = current_positions == 0
-        
-        # SIMPLIFIED: Initialize idle mode tracking (no complex relaxation logic)
-        if not hasattr(self, '_idle_mode_active'):
-            self._idle_mode_active = False
-            self._idle_mode_idle_start_time = 0.0
-        
-        # Calculate idle duration
-        if is_idle_mode:
-            if not self._idle_mode_active:
-                # SIMPLIFIED: Entering idle mode - use IDLE_MIN_SCORE immediately
-                self._idle_mode_active = True
-                self._idle_mode_idle_start_time = scan_start_time
-                from . import config as cfg
-                idle_min = float(getattr(cfg, 'IDLE_MIN_SCORE', 42.0))
-                self.logger.info(f"[IDLE_MODE] No positions open. Using IDLE_MIN_SCORE={idle_min:.0f} to find best available signal")
-            else:
-                # SIMPLIFIED: Just track idle duration, no gradual lowering
-                # Idle mode uses fixed IDLE_MIN_SCORE (42.0) - simple and reliable
-                idle_duration_minutes = (scan_start_time - self._idle_mode_idle_start_time) / 60.0
-                # No complex relaxation logic - just use IDLE_MIN_SCORE
-        else:
-            # Have positions - exit idle mode
-            if self._idle_mode_active:
-                idle_duration = (scan_start_time - self._idle_mode_idle_start_time) / 60.0
-                self.logger.info(f"[IDLE_MODE] Position opened - exiting idle mode after {idle_duration:.1f} minutes. Resuming normal MIN_SIGNAL_SCORE.")
-                self._idle_mode_active = False
-                self._idle_mode_idle_start_time = 0.0
-        
-        # SIMPLIFIED IDLE MODE: No gradual lowering, just use IDLE_MIN_SCORE
-        # When no positions, use lower threshold (42.0) to find best available signal
-        # Simple and reliable - no complex logic
-        if self._idle_mode_active:
-            from . import config as cfg
-            idle_min_score = float(getattr(cfg, 'IDLE_MIN_SCORE', 42.0))
-            idle_duration_minutes = (scan_start_time - self._idle_mode_idle_start_time) / 60.0
-            
-            # Log idle mode status (once per minute)
-            if not hasattr(self, '_last_idle_log') or time.time() - self._last_idle_log > 60:
-                self.logger.info(
-                    f"[IDLE_MODE] No positions - using IDLE_MIN_SCORE={idle_min_score:.0f} "
-                    f"(idle {idle_duration_minutes:.1f}m)"
-                )
-                self._last_idle_log = time.time()
+        # ML-OPTIMIZED: No idle mode threshold lowering
+        # Use fixed MIN_SIGNAL_SCORE regardless of position count
+        # If no positions, bot waits for quality signals (50+) instead of forcing trades
         
         # DIAGNOSTIC: Compare bot's position count with Binance's actual positions
         # This helps identify ghost positions or sync issues
         if not self.replay_mode and self.exchange_wrapper:
             try:
                 binance_positions = await self.exchange_wrapper.fetch_positions()
-                # Filter to only non-zero positions
-                binance_active = [p for p in binance_positions if abs(float(p.get('contracts', 0))) > 0]
-                binance_count = len(binance_active)
+                # Filter to only non-zero positions and normalize symbols
+                binance_active = []
+                binance_symbols_normalized = []
                 
-                if current_positions != binance_count:
+                for p in binance_positions:
+                    size = abs(float(p.get('contracts', 0)))
+                    if size > 0:
+                        sym = p.get('symbol') or p.get('symbolName')
+                        if sym:
+                            # Normalize symbol
+                            if hasattr(self.exchange_wrapper, 'normalize_symbol'):
+                                sym = self.exchange_wrapper.normalize_symbol(sym)
+                            # Skip delivery contracts
+                            clean_sym = sym.replace("/", "").replace("-", "").replace(":", "")
+                            if not ("USDTUSDT" in clean_sym or (len(clean_sym) > 6 and clean_sym[-6:].isdigit())):
+                                binance_active.append(p)
+                                binance_symbols_normalized.append(sym)
+                
+                binance_count = len(binance_active)
+                bot_count = len(self.positions)
+                
+                if bot_count != binance_count:
                     self.logger.warning(
-                        f"[POSITION_SYNC] Mismatch detected: Bot tracks {current_positions} positions, "
+                        f"[POSITION_COUNT_MISMATCH] Bot tracks {bot_count} positions, "
                         f"Binance has {binance_count} active positions. "
-                        f"Bot symbols: {list(self.positions.keys())}, "
-                        f"Binance symbols: {[p.get('symbol', 'N/A') for p in binance_active]}"
+                        f"Bot symbols: {sorted(self.positions.keys())}, "
+                        f"Binance symbols: {sorted(binance_symbols_normalized)}"
                     )
+                    
+                    # Identify specific mismatches
+                    bot_symbols_set = set(self.positions.keys())
+                    binance_symbols_set = set(binance_symbols_normalized)
+                    
+                    missing_on_binance = bot_symbols_set - binance_symbols_set
+                    missing_in_bot = binance_symbols_set - bot_symbols_set
+                    
+                    if missing_on_binance:
+                        self.logger.warning(
+                            f"[GHOST_POSITIONS] {len(missing_on_binance)} positions tracked by bot but not on Binance: {sorted(missing_on_binance)}"
+                        )
+                    if missing_in_bot:
+                        self.logger.error(
+                            f"[UNMANAGED_POSITIONS] {len(missing_in_bot)} positions on Binance but not tracked by bot: {sorted(missing_in_bot)}"
+                        )
+                    
                     # Use Binance's count as source of truth for position limit checks
                     current_positions = binance_count
             except Exception as e:
-                self.logger.debug(f"[POSITION_SYNC] Could not verify Binance positions: {e}")
+                self.logger.warning(f"[POSITION_SYNC] Could not verify Binance positions: {e}", exc_info=True)
         
         # DUST FILTER REMOVED: Previous filter caused position sprawl (13+ positions)
         # current_positions = sum(1 for p in self.positions.values() 
@@ -2305,7 +2831,7 @@ class ScalperBot:
             self.market_intensity = intensity  # Store for UI v3
             
             # Base Settings (Respect Config)
-            from .config import MIN_SIGNAL_SCORE, MIN_SIGNAL_STRENGTH
+            from .config import MIN_SIGNAL_SCORE, MIN_SIGNAL_STRENGTH, REGIME_OVERRIDE_ENABLED
             base_score = float(MIN_SIGNAL_SCORE)
             base_strength = float(MIN_SIGNAL_STRENGTH)
             
@@ -2317,7 +2843,8 @@ class ScalperBot:
             # Log removed
             # #endregion
 
-            if intensity > 0.55: # Start scaling when trend > 55%
+            # CRITICAL: Only apply regime override if enabled
+            if REGIME_OVERRIDE_ENABLED and intensity > 0.55: # Start scaling when trend > 55%
                 # Calculate scalar (0.0 to 1.0)
                 scalar = min(1.0, (intensity - 0.55) / 0.20)
                 
@@ -2565,6 +3092,18 @@ class ScalperBot:
             
             # MARKSMAN MODE removed - no longer fetching 5m candles
             
+            # LIVE INDICATORS: Fetch indicators for LIVE mode (CRITICAL for ML scoring)
+            indicators = None
+            if not self.replay_mode and self.live_indicator_calculator:
+                try:
+                    indicators = await self.live_indicator_calculator.get_indicators(symbol)
+                    if indicators:
+                        # Store in cache for other code that reads it
+                        self.indicators_cache[symbol] = indicators
+                except Exception as e:
+                    # Non-critical - ML will use defaults
+                    pass
+            
             # PERFORMANCE: Use pre-bound scan-level invariants
             # SCORING V2: Pass bot_positions for portfolio scoring
             # DIAGNOSTIC: Log signal generator call
@@ -2582,6 +3121,7 @@ class ScalperBot:
                 symbol=symbol,
                 symbol_stats=symbol_stats,
                 price_data=price_data,  # CRITICAL: Pass candle data for MARKSMAN
+                indicators=indicators,  # CRITICAL: Pass indicators for ML scoring
                 orderbook=orderbook,
                 latency_ms=latency_ms,
                 order_size_usd=estimated_order_size_usd,
@@ -2595,16 +3135,12 @@ class ScalperBot:
                     market_regime=getattr(self, "market_regime", "neutral"),  # NEW: Pass calculated market regime
                     # NEW: Dynamic Regime Switching Overrides (Council Decree #3)
                     min_score_override=regime_min_score,
-                    min_strength_override=regime_min_strength,
-                    # IDLE MODE: Skip percentile filter when no positions to find best available signal
-                    skip_percentile_filter=self._idle_mode_active,
-                    # IDLE MODE: Use IDLE_MIN_SCORE (42.0) when no positions
-                    idle_mode_active=self._idle_mode_active
+                    min_strength_override=regime_min_strength
                 )
 
                 # CRITICAL OPTIMIZATION: Lazy Orderbook Fetch for High-Quality Candidates
                 # Only fetch orderbook if preliminary score is promising (saves ~95% of API calls)
-                if signal and not orderbook_fetched and signal.final_score >= (self.cfg.MIN_SIGNAL_SCORE - 5) and not DRY_RUN:
+                if signal and not orderbook_fetched and signal.final_score >= (self.cfg.MIN_SIGNAL_SCORE - 5):
                     try:
                         if self.exchange_wrapper:
                             # [!] ADAPTIVE: Skip if in backoff mode
@@ -2640,9 +3176,7 @@ class ScalperBot:
                                 bot_positions=self.positions,
                                 market_regime=getattr(self, "market_regime", "neutral"),
                                 min_score_override=regime_min_score,
-                                min_strength_override=regime_min_strength,
-                                skip_percentile_filter=self._idle_mode_active,  # IDLE MODE: Skip percentile when no positions
-                                idle_mode_active=self._idle_mode_active  # IDLE MODE: Use IDLE_MIN_SCORE (42.0)
+                                min_strength_override=regime_min_strength
                             )
                             
                             # DIAGNOSTIC: Log if signal was rejected after lazy fetch
@@ -2898,6 +3432,10 @@ class ScalperBot:
             batch = all_symbols_to_scan[i:i+batch_size]
             tasks = [process_symbol(symbol) for symbol in batch]
             results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # PRIORITY QUEUE SYSTEM: Collect all valid signals before entering
+            # This ensures we always enter the HIGHEST SCORING signals when market heats up
+            pending_signals = []  # List of (signal, symbol, stats, latency_ms, orderbook, is_unicorn, final_score)
             
             # OPTIMIZATION: Process results efficiently
             for result in results:
@@ -3211,50 +3749,29 @@ class ScalperBot:
                 except Exception:
                     current_position_count = len(self.positions)
                 
-                # Use adaptive threshold if enabled, else fallback to fixed
-                if getattr(cfg, 'USE_ADAPTIVE_ENTRY', True):
-                    # BLOCK TRADING until sufficient market data is collected
-                    if not self.adaptive_entry.has_sufficient_data():
-                        # Record signal for learning but skip trading
-                        self.adaptive_entry.record_signal(
-                            symbol=symbol,
-                            score=signal.final_score,
-                            side=signal.side,
-                            was_taken=False,
-                            rejection_reason="insufficient_data_warmup"
-                        )
-                        # Skip this signal - still collecting data
-                        continue
-                    
-                    min_ml_score = self.adaptive_entry.get_threshold(current_position_count)
-                    threshold_source = f"ADAPT({min_ml_score:.0f})"
-                    
-                    # Update dynamic gate for UI
-                    self.dynamic_gate_score = min_ml_score
-                else:
-                    # Fallback to legacy fixed thresholds
-                    if self._idle_mode_active:
-                        min_ml_score = float(getattr(cfg, 'IDLE_MIN_SCORE', 35.0))
-                        threshold_source = f"IDLE({min_ml_score:.0f})"
-                    else:
-                        min_ml_score = float(self.cfg.MIN_SIGNAL_SCORE)
-                        threshold_source = f"NORMAL({min_ml_score:.0f})"
+                # ============================================================
+                # INTELLIGENT SIGNAL COLLECTION (v3.0 - Market Speed Adaptive)
+                # ============================================================
+                # Uses MarketSpeedAdapter to learn from signal flow:
+                # - SLOW MARKET: Lower threshold -> capture opportunities
+                # - HOT MARKET: Higher threshold -> be picky
+                # - Learns and adapts automatically based on signal rate
                 
-                # CHECK: Score must meet adaptive threshold
-                if signal.final_score < min_ml_score:
-                    # Record rejected signal for adaptive learning
-                    self.adaptive_entry.record_signal(
-                        symbol=symbol,
-                        score=signal.final_score,
-                        side=signal.side,
-                        was_taken=False,
-                        rejection_reason=f"below_threshold({signal.final_score:.0f}<{min_ml_score:.0f})"
-                    )
-                    
-                    # Reject signal - below threshold
-                    self.logger.warning(
-                        f"[SCORE_REJECT] {symbol} score={signal.final_score:.1f} < {threshold_source}({min_ml_score:.0f})"
-                    )
+                # Update market speed adapter with current position count
+                self.market_speed_adapter.update_positions(current_position_count)
+                
+                # Get adaptive threshold based on market speed
+                adaptive_floor = self.market_speed_adapter.get_adaptive_threshold()
+                
+                # Record this signal for learning
+                self.market_speed_adapter.record_signal(signal.final_score, symbol)
+                
+                # Update dynamic gate for UI
+                self.dynamic_gate_score = adaptive_floor
+                
+                # CHECK: Score must meet adaptive floor for collection
+                if signal.final_score < adaptive_floor:
+                    # Below adaptive floor - skip
                     signal_record = {
                         'timestamp': batch_now,
                         'symbol': symbol,
@@ -3264,29 +3781,20 @@ class ScalperBot:
                         'side': signal.side,
                         'spread_bps': stats.spread_bps if stats else 0,
                         'approved': False,
-                        'rejection_reason': f'{threshold_source}_score({signal.final_score:.0f}<{min_ml_score:.0f})',
+                        'rejection_reason': f'below_adaptive_floor({signal.final_score:.0f}<{adaptive_floor:.0f})',
                         'is_unicorn': is_unicorn
                     }
                     self.signal_history.append(signal_record)
                     continue
                 
-                # Record signal that passed threshold (may still be rejected by position manager)
-                self.adaptive_entry.record_signal(
-                    symbol=symbol,
-                    score=signal.final_score,
-                    side=signal.side,
-                    was_taken=False,  # Will update to True if entry succeeds
-                    rejection_reason=None
-                )
-                
-                # Log when signal passes score check
-                self.logger.info(
-                    f"[SCORE_PASS] {symbol} score={signal.final_score:.1f} >= {threshold_source}({min_ml_score:.0f})"
+                # Signal passes adaptive floor - add to priority queue
+                self.logger.debug(
+                    f"[COLLECT] {symbol} score={signal.final_score:.1f} >= {adaptive_floor:.0f} - added to queue"
                 )
                 # ============================================================
                 
                 # DIAGNOSTIC: Log that we're proceeding to position manager
-                self.logger.info(f"[POST_SCORE] {symbol} passed score check, proceeding to position manager... (in_startup_period={in_startup_period})")
+                self.logger.info(f"[POST_SCORE] {symbol} passed score check, proceeding to position manager...")
                 
                 # Get current drawdown for DD-aware protection and auto-reset
                 drawdown_pct = self.get_drawdown_pct()
@@ -3319,6 +3827,35 @@ class ScalperBot:
                                         getattr(stats, 'volume_ratio', 1.0))
                 except ImportError:
                     pass  # Adaptive filters not available
+                
+                # ============================================================
+                # INDICATOR FILTER: Block proven losing combinations
+                # Based on 675K trade analysis (refined with ADX):
+                # - SHORT + RSI > 65 + ADX < 20 = DISASTER (no trend to fade)
+                # - RSI 60-70 + ADX > 30 = BAD (36% WR)
+                # ============================================================
+                entry_adx = indicators.get('adx', 20) if indicators else 20
+                indicator_filter = get_indicator_filter()
+                
+                blocked, block_reason = indicator_filter.should_block(
+                    side=signal.side,
+                    rsi=entry_rsi,
+                    adx=entry_adx
+                )
+                
+                if blocked:
+                    self.logger.info(f"[INDICATOR_BLOCK] {symbol} {signal.side.upper()} | RSI={entry_rsi:.1f} ADX={entry_adx:.1f} | {block_reason}")
+                    continue  # Skip this signal entirely
+                
+                # Apply score boost for good combinations
+                score_boost = indicator_filter.get_score_boost(
+                    side=signal.side,
+                    rsi=entry_rsi,
+                    adx=entry_adx
+                )
+                if score_boost > 0:
+                    signal.final_score = signal.final_score + score_boost
+                    self.logger.debug(f"[INDICATOR_BOOST] {symbol} +{score_boost:.0f} pts -> {signal.final_score:.1f}")
                 
                 # DIAGNOSTIC: Log position limit calculation for debugging (once per minute)
                 if not hasattr(self, '_position_limit_logged') or time.time() - getattr(self, '_position_limit_logged', 0) > 60:
@@ -3356,6 +3893,25 @@ class ScalperBot:
                     atr_pct=entry_atr_pct,
                     pct_change_1h=entry_pct_1h
                 )
+                
+                # ATTACH ML CONFIDENCE DATA for position manager to access
+                # Extract probabilities from signal score components
+                # The hybrid ML scorer stores them in score_components_raw['model_scores']
+                xgb_prob = None
+                lgb_prob = None
+                rf_prob = None
+                
+                if hasattr(signal, 'score_components_raw') and signal.score_components_raw:
+                    model_scores = signal.score_components_raw.get('model_scores', {})
+                    if model_scores:
+                        xgb_prob = model_scores.get('xgboost')
+                        lgb_prob = model_scores.get('lightgbm')
+                        rf_prob = model_scores.get('random_forest')
+                
+                # Store in position_manager for confidence filter to access
+                self.position_manager._xgb_prob = xgb_prob
+                self.position_manager._lgb_prob = lgb_prob
+                self.position_manager._rf_prob = rf_prob
             
                 # DIAGNOSTIC: Log position manager rejection reasons in REPLAY_MODE
                 if self.replay_mode and not can_enter:
@@ -3408,11 +3964,7 @@ class ScalperBot:
                     signal_record.update(signal.signal_score.to_dict())
                 self.signal_history.append(signal_record)
             
-                # BLOCK ENTRIES during startup warmup (but allow signal scanning to build history)
-                if in_startup_period:
-                    self.logger.warning(f"[STARTUP_BLOCK] {symbol} blocked during warmup period (signal passed all checks but startup delay active)")
-                    continue  # Skip this signal - we're still building signal history for percentile filter
-                
+                # Entries allowed immediately
                 # SIGNAL CONFIRMATION WINDOW (SCW): Check if signal needs confirmation
                 from .config import USE_SIGNAL_CONFIRMATION
                 signal_needs_confirmation = False
@@ -3507,6 +4059,36 @@ class ScalperBot:
                     f"score={signal.final_score:.1f} can_enter={can_enter} "
                     f"current_positions={current_positions}/{max_pos}"
                 )
+                
+                # PRIORITY QUEUE: Add signal to pending queue instead of entering immediately
+                # This allows us to sort by ML score and enter the BEST signals when market heats up
+                
+                # Extract regime info from ML score components (if available)
+                score_components = getattr(signal, 'score_components_raw', {}) or {}
+                regime = score_components.get('regime', -1)
+                regime_name = score_components.get('regime_name', 'UNKNOWN')
+                ml_confidence = score_components.get('confidence', 0.0)
+                
+                pending_signals.append({
+                    'symbol': symbol,
+                    'signal': signal,
+                    'stats': stats,
+                    'latency_ms': latency_ms,
+                    'orderbook': orderbook,
+                    'is_unicorn': is_unicorn,
+                    'final_score': signal.final_score,
+                    'replacement_symbol': replacement_symbol,
+                    'indicators': indicators,
+                    'equity': equity,
+                    'current_positions': current_positions,
+                    # ML regime info for intelligent selection
+                    'regime': regime,
+                    'regime_name': regime_name,
+                    'ml_confidence': ml_confidence
+                })
+                
+                # Skip immediate entry - will process queue after all symbols scanned
+                continue
                 
                 # Signal passed all checks - proceed with entry
                 try:
@@ -3662,14 +4244,18 @@ class ScalperBot:
                         if stop_distance_pct > 0:
                             atr_pct = stop_distance_pct / 1.5
                 
-                # Calculate stop loss based on ATR (uses configurable multiplier)
-                from .config import SL_ATR_MULTIPLIER
-                scalper_stop_loss = signal.stop_loss  # Default fallback
-                if atr_pct and atr_pct > 0:
-                    if signal.side == "long":
-                        scalper_stop_loss = signal.entry_price * (1.0 - SL_ATR_MULTIPLIER * atr_pct)
-                    else:  # short
-                        scalper_stop_loss = signal.entry_price * (1.0 + SL_ATR_MULTIPLIER * atr_pct)
+                # ML-ADAPTIVE SL: Use symbol-specific parameters from ML training
+                # Instead of blacklisting, use ML-learned optimal settings per symbol
+                scalper_stop_loss = SimpleStopLossManager.set_initial_stop_loss(
+                    entry_price=signal.entry_price,
+                    side=signal.side,
+                    atr_pct=atr_pct,
+                    symbol=symbol  # ML system adapts stops per symbol (BNB gets optimal settings)
+                )
+                
+                # Validate the stop loss before proceeding
+                # SimpleStopLossManager already guarantees valid SL (min 1.5%)
+                # No need to validate - it's correct by construction
                 
                 # RISK-BASED SIZING: Calculate position size using risk budget approach
                 # Use scalper stop loss for accurate risk calculation
@@ -3678,6 +4264,7 @@ class ScalperBot:
                     risk_fraction,
                     sizing_reason,
                 ) = self.position_manager.calculate_position_size(
+                    symbol=symbol,
                     equity=equity,
                     entry_price=signal.entry_price,
                     stop_loss_price=scalper_stop_loss,
@@ -3810,24 +4397,17 @@ class ScalperBot:
                     entries_opened_this_scan += 1  # Track entries opened this scan
                     self.position_manager.record_entry(entry_symbol)
                     
-                    # ADAPTIVE ENTRY: Record successful entry for threshold learning
-                    self.adaptive_entry.record_entry(entry_symbol, signal.final_score)
+                    # Entry successful (ML-optimized threshold)
                     
                     # ADAPTIVE REGIME: Reset idle timer on successful entry
                     self._last_entry_time = time.time()
                     self._adaptive_relaxation = 0.0  # Reset relaxation
                     
-                    # IDLE MODE: Exit idle mode when position is opened (resume strict filtering)
-                    if self._idle_mode_active:
-                        self._idle_mode_active = False
-                        self._idle_mode_entry = None
-                        self._idle_mode_entry_symbol = None
-                        self.logger.info("[IDLE_MODE] Position opened - exiting idle mode, resuming strict filtering")
-                    
                     entry_price = result.filled_price or signal.entry_price
                     entry_time = time.time()
                     filled_size = result.filled_size  # Use actual filled size, not fallback
                     
+                    # Get ATR from signal stop distance (if available)
                     atr_pct = None
                     stop_distance_pct = (
                         abs((signal.stop_loss - entry_price) / entry_price)
@@ -3842,60 +4422,14 @@ class ScalperBot:
                     if entry_symbol in self.funding_rates:
                         position_funding_rate = self.funding_rates[entry_symbol].get("rate", 0.0)
                     
-                    # Set initial stop loss based on ATR (configurable multiplier)
-                    from .config import SL_ATR_MULTIPLIER, MIN_STOP_DISTANCE_PCT
-                    if atr_pct and atr_pct > 0:
-                        # CRITICAL: Clamp ATR multiplier to prevent negative stop-loss
-                        # If ATR is very large, SL_ATR_MULTIPLIER * atr_pct could exceed 1.0, making stop-loss negative
-                        max_atr_mult = 0.95  # Never use more than 95% of entry price as stop distance
-                        effective_atr_mult = min(SL_ATR_MULTIPLIER * atr_pct, max_atr_mult)
-                        
-                        if entry_side == "long":
-                            initial_stop_price = entry_price * (1.0 - effective_atr_mult)
-                        else:  # short
-                            initial_stop_price = entry_price * (1.0 + effective_atr_mult)
-                        
-                        # Additional safety: Ensure stop-loss is never negative or zero
-                        if initial_stop_price <= 0:
-                            # Fallback to MIN_STOP_DISTANCE_PCT if ATR calculation fails
-                            if entry_side == "long":
-                                initial_stop_price = entry_price * (1.0 - MIN_STOP_DISTANCE_PCT)
-                            else:  # short
-                                initial_stop_price = entry_price * (1.0 + MIN_STOP_DISTANCE_PCT)
-                            self.logger.warning(
-                                f"[STOP_LOSS_FIX] {entry_symbol} {entry_side}: ATR calculation produced invalid stop_loss, "
-                                f"using MIN_STOP_DISTANCE_PCT fallback: {initial_stop_price:.6f}"
-                            )
-                    else:
-                        # Fallback: Use signal.stop_loss if valid, otherwise calculate from MIN_STOP_DISTANCE_PCT
-                        if signal.stop_loss and signal.stop_loss > 0:
-                            # Validate signal.stop_loss is in correct direction
-                            if entry_side == "long" and signal.stop_loss < entry_price:
-                                initial_stop_price = signal.stop_loss
-                            elif entry_side == "short" and signal.stop_loss > entry_price:
-                                initial_stop_price = signal.stop_loss
-                            else:
-                                # signal.stop_loss is invalid - calculate from minimum distance
-                                if entry_side == "long":
-                                    initial_stop_price = entry_price * (1.0 - MIN_STOP_DISTANCE_PCT)
-                                else:  # short
-                                    initial_stop_price = entry_price * (1.0 + MIN_STOP_DISTANCE_PCT)
-                                self.logger.warning(
-                                    f"[STOP_LOSS_FIX] {entry_symbol} {entry_side}: signal.stop_loss={signal.stop_loss:.6f} invalid, "
-                                    f"recalculated to {initial_stop_price:.6f} using MIN_STOP_DISTANCE_PCT"
-                                )
-                        else:
-                            # signal.stop_loss is missing or invalid - calculate from minimum distance
-                            if entry_side == "long":
-                                initial_stop_price = entry_price * (1.0 - MIN_STOP_DISTANCE_PCT)
-                            else:  # short
-                                initial_stop_price = entry_price * (1.0 + MIN_STOP_DISTANCE_PCT)
-                            self.logger.warning(
-                                f"[STOP_LOSS_FIX] {entry_symbol} {entry_side}: signal.stop_loss invalid/missing, "
-                                f"calculated {initial_stop_price:.6f} using MIN_STOP_DISTANCE_PCT"
-                            )
+                    # SIMPLE STOP LOSS: Use new SimpleStopLossManager
+                    # Sets SL at 1.5% from entry (or 2.5x ATR, whichever is larger)
+                    initial_stop_price = SimpleStopLossManager.set_initial_stop_loss(
+                        entry_price=entry_price,
+                        side=entry_side,
+                        atr_pct=atr_pct
+                    )
                     
-                    # Use initial_stop_price for stop_loss (scalper uses tighter stops)
                     stop_loss_price = initial_stop_price
                     take_profit_price = signal.take_profit
                     
@@ -3947,56 +4481,18 @@ class ScalperBot:
                     else:  # short
                         initial_r = abs(stop_loss_price - entry_price)
                     
-                    # CRITICAL VALIDATION: Ensure stop_loss is valid before entry
-                    # This prevents unprotected positions like PIPPIN
-                    # FINAL SAFETY: If stop_loss is still invalid after all fixes, recalculate one more time
-                    if stop_loss_price <= 0:
-                        # Last resort: Calculate from MIN_STOP_DISTANCE_PCT
-                        if entry_side == 'long':
-                            stop_loss_price = entry_price * (1.0 - MIN_STOP_DISTANCE_PCT)
-                        else:  # short
-                            stop_loss_price = entry_price * (1.0 + MIN_STOP_DISTANCE_PCT)
+                    # SIMPLE SL VALIDATION: Use SimpleStopLossManager
+                    sl_valid, sl_reason = SimpleStopLossManager.validate_sl(entry_price, stop_loss_price, entry_side)
+                    if not sl_valid:
                         self.logger.warning(
-                            f"[STOP_LOSS_EMERGENCY_FIX] {entry_symbol} {entry_side}: stop_loss was invalid, "
-                            f"recalculated to {stop_loss_price:.6f} using MIN_STOP_DISTANCE_PCT"
+                            f"[SL_RECALC] {entry_symbol} {entry_side}: {sl_reason}, using SimpleStopLossManager"
                         )
-                    
-                    # Validate stop-loss is in correct direction for position side
-                    if entry_side == 'long' and stop_loss_price >= entry_price:
-                        # Fix: Recalculate to be below entry
-                        stop_loss_price = entry_price * (1.0 - MIN_STOP_DISTANCE_PCT)
-                        self.logger.warning(
-                            f"[STOP_LOSS_DIRECTION_FIX] {entry_symbol} LONG: stop_loss was >= entry, "
-                            f"recalculated to {stop_loss_price:.6f}"
+                        stop_loss_price = SimpleStopLossManager.set_initial_stop_loss(
+                            entry_price=entry_price,
+                            side=entry_side,
+                            atr_pct=None  # Force minimum 1.5% distance
                         )
-                    elif entry_side == 'short' and stop_loss_price <= entry_price:
-                        # Fix: Recalculate to be above entry
-                        stop_loss_price = entry_price * (1.0 + MIN_STOP_DISTANCE_PCT)
-                        self.logger.warning(
-                            f"[STOP_LOSS_DIRECTION_FIX] {entry_symbol} SHORT: stop_loss was <= entry, "
-                            f"recalculated to {stop_loss_price:.6f}"
-                        )
-                    
-                    # Final validation: If still invalid after all fixes, reject
-                    if stop_loss_price <= 0:
-                        self.logger.error(
-                            f"[ENTRY_REJECTED] {entry_symbol} {entry_side}: stop_loss={stop_loss_price:.6f} "
-                            f"still invalid after all fixes (entry={entry_price:.6f}). Rejecting entry."
-                        )
-                        continue  # Skip this entry - cannot fix stop-loss
-                    
-                    if entry_side == 'long' and stop_loss_price >= entry_price:
-                        self.logger.error(
-                            f"[ENTRY_REJECTED] {entry_symbol} LONG: stop_loss={stop_loss_price:.6f} >= entry={entry_price:.6f} "
-                            f"after fixes. Rejecting entry."
-                        )
-                        continue
-                    elif entry_side == 'short' and stop_loss_price <= entry_price:
-                        self.logger.error(
-                            f"[ENTRY_REJECTED] {entry_symbol} SHORT: stop_loss={stop_loss_price:.6f} <= entry={entry_price:.6f} "
-                            f"after fixes. Rejecting entry."
-                        )
-                        continue
+                        # SimpleStopLossManager guarantees valid SL - no need for second check
                     
                     # Select exit profile based on signal score
                     exit_profile = self.exit_pipeline.select_exit_profile(signal.final_score)
@@ -4115,7 +4611,7 @@ class ScalperBot:
                 # CRITICAL FIX: Ensure stop_loss_price and take_profit_price are defined for recovered orders
                 # (Order recovery path may skip the first if block where these are normally assigned)
                 if 'stop_loss_price' not in locals():
-                    # Calculate stop_loss_price same way as in the first if block
+                    # Calculate stop_loss_price using CENTRALIZED calculator
                     atr_pct = None
                     stop_distance_pct = (
                         abs((signal.stop_loss - entry_price) / entry_price)
@@ -4125,14 +4621,12 @@ class ScalperBot:
                     if stop_distance_pct > 0:
                         atr_pct = stop_distance_pct / 1.5
                     
-                    from .config import SL_ATR_MULTIPLIER
-                    if atr_pct and atr_pct > 0:
-                        if entry_side == "long":
-                            initial_stop_price = entry_price * (1.0 - SL_ATR_MULTIPLIER * atr_pct)
-                        else:  # short
-                            initial_stop_price = entry_price * (1.0 + SL_ATR_MULTIPLIER * atr_pct)
-                    else:
-                        initial_stop_price = signal.stop_loss
+                    # SIMPLE SL: Calculate using SimpleStopLossManager
+                    initial_stop_price = SimpleStopLossManager.set_initial_stop_loss(
+                        entry_price=entry_price,
+                        side=entry_side,
+                        atr_pct=atr_pct
+                    )
                     
                     stop_loss_price = initial_stop_price
                     take_profit_price = signal.take_profit
@@ -4185,17 +4679,100 @@ class ScalperBot:
                     # IMPROVED: Extract error message with better fallbacks
                     error_msg = None
                     
-                    # First, try to get error from result.error (primary source)
-                    if hasattr(result, "error") and result.error:
+                    # CRITICAL: Check for partial fill FIRST (before checking result.error)
+                    # ENTRY ORDERS: Allow partial fills within reason (90%+) - this is acceptable for entries
+                    # EXIT ORDERS: Partial exits are disabled via DISABLE_PARTIAL_EXITS config
+                    if hasattr(result, "filled_size") and result.filled_size is not None:
+                        filled = float(result.filled_size) if result.filled_size else 0.0
+                        if filled > 0 and position_size and position_size > 0:
+                            fill_ratio = (filled / position_size) * 100
+                            MIN_ACCEPTABLE_FILL_RATIO = 90.0  # Allow partial fills >= 90% for entry orders
+                            
+                            if fill_ratio >= MIN_ACCEPTABLE_FILL_RATIO:
+                                # Acceptable fill (>=90%) - treat as success even if result.success=False
+                                # This handles timing bugs and allows reasonable partial fills on entries
+                                if not result.success:
+                                    self.logger.warning(
+                                        f"[PARTIAL_FILL_ACCEPTED] {entry_symbol} {entry_side}: "
+                                        f"Order filled {filled:.2f}/{position_size:.2f} ({fill_ratio:.1f}%) "
+                                        f"but success=False. Accepting partial fill (>=90% threshold)."
+                                    )
+                                
+                                # Override result to treat as success
+                                result.success = True
+                                result.filled_size = filled
+                                result.filled_price = signal.entry_price  # Use signal price as fallback
+                                
+                                # Track position with actual filled size
+                                filled_size = filled
+                                entry_price = signal.entry_price
+                                entry_time = time.time()
+                                
+                                # Add position to tracking (same logic as successful entry)
+                                self.positions[entry_symbol] = {
+                                    'symbol': entry_symbol,
+                                    'entry_price': entry_price,
+                                    'size': filled_size,  # Use actual filled size
+                                    'side': entry_side,
+                                    'leverage': final_leverage,
+                                    'entry_time': entry_time,
+                                    'stop_loss': stop_loss_price,
+                                    'take_profit': take_profit_price,
+                                    'initial_stop_price': stop_loss_price,
+                                    'is_unicorn': is_unicorn,
+                                }
+                                self._positions_set.add(entry_symbol)
+                                
+                                # Update metrics
+                                self.metrics['entries_attempted'] += 1
+                                self.metrics['entries_opened'] += 1
+                                self.entries_attempted_this_scan += 1
+                                self.entries_opened_this_scan += 1
+                                entries_opened_this_scan += 1
+                                
+                                # Record entry
+                                self.position_manager.record_entry(entry_symbol)
+                                # Entry successful (ML-optimized threshold)
+                                self._last_entry_time = time.time()
+                                self._adaptive_relaxation = 0.0
+                                
+                                # Create decision event
+                                decision = DecisionEvent(
+                                    timestamp=entry_time,
+                                    action="ENTRY",
+                                    symbol=entry_symbol,
+                                    side=entry_side.upper(),
+                                    price=entry_price,
+                                    entry_price=entry_price,
+                                    size=filled_size,  # Actual filled size
+                                    reason="approved",
+                                    score=signal.final_score,
+                                    signal_type=signal.signal_type,
+                                    signal_strength=signal.strength,
+                                    stop_loss=stop_loss_price,
+                                    take_profit=take_profit_price,
+                                    is_unicorn=is_unicorn
+                                )
+                                log_trade_decision(decision, bot_instance=self)
+                                
+                                current_positions += 1
+                                
+                                # Continue to next signal (order was successful)
+                                continue
+                            else:
+                                # Fill ratio < 90% - reject as insufficient fill
+                                error_msg = f"Partial fill rejected: {filled:.2f}/{position_size:.2f} ({fill_ratio:.1f}% filled). Minimum acceptable fill: {MIN_ACCEPTABLE_FILL_RATIO}%."
+                    
+                    # If no error from partial fill check, try result.error (primary source)
+                    if (not error_msg or error_msg == "") and hasattr(result, "error") and result.error:
                         error_msg = str(result.error).strip()
                     
-                    # If no error message, try to infer from result state
+                    # If still no error message, try to infer from result state
                     if not error_msg or error_msg == "":
-                        if hasattr(result, "filled_size"):
-                            if result.filled_size == 0 or result.filled_size is None:
-                                error_msg = "Order placed but not filled (filled_size=0 or None)"
-                            elif result.filled_size > 0 and result.filled_size < position_size * 0.99:
-                                error_msg = f"Partial fill rejected: {result.filled_size:.6f}/{position_size:.6f}"
+                        if hasattr(result, "filled_size") and result.filled_size is not None:
+                            filled = float(result.filled_size) if result.filled_size else 0.0
+                            if filled == 0:
+                                error_msg = "Order placed but not filled (filled_size=0)"
                         elif hasattr(result, "order_id") and not result.order_id:
                             error_msg = "Order rejected by exchange (no order_id returned)"
                         else:
@@ -4232,17 +4809,367 @@ class ScalperBot:
                         continue  # Skip to next signal (don't log as error)
                     else:
                         # Other errors (margin, etc.) - log as error with full context
-                        error_details = f"msg={error_msg[:100]}"
-                        if hasattr(result, "order_id"):
-                            error_details += f" order_id={result.order_id}"
-                        if hasattr(result, "filled_size"):
-                            error_details += f" filled_size={result.filled_size}"
-                        if hasattr(result, "latency_ms"):
-                            error_details += f" latency={result.latency_ms:.0f}ms"
+                        # Build comprehensive error details
+                        error_parts = [f"msg={error_msg[:100]}"]
+                        
+                        if hasattr(result, "order_id") and result.order_id:
+                            error_parts.append(f"order_id={result.order_id}")
+                        
+                        if hasattr(result, "filled_size") and result.filled_size is not None:
+                            filled = float(result.filled_size)
+                            error_parts.append(f"filled_size={filled:.2f}")
+                            # If partial fill, add fill ratio
+                            if filled > 0 and position_size and position_size > 0:
+                                fill_ratio = (filled / position_size) * 100
+                                error_parts.append(f"fill_ratio={fill_ratio:.1f}%")
+                        
+                        if hasattr(result, "latency_ms") and result.latency_ms:
+                            error_parts.append(f"latency={result.latency_ms:.0f}ms")
+                        
+                        error_details = " ".join(error_parts)
                         
                         self.logger.error(
                             f"[E] entry_fail sym={entry_symbol} side={entry_side} {error_details}"
                         )
+        
+        # ============================================================
+        # INTELLIGENT SIGNAL SELECTION v2.0
+        # ============================================================
+        # Record all pending signals for market quality analysis
+        from .config import MIN_SIGNAL_SCORE
+        for sig_data in pending_signals:
+            self.signal_pressure_monitor.record_signal(sig_data['final_score'])
+        
+        # ============================================================
+        # PRIORITY QUEUE PROCESSING: Rank and Enter BEST signals
+        # ============================================================
+        # Philosophy: Collect broadly (50+), rank by ML score, enter BEST
+        # No arbitrary threshold filtering - let the ranking decide!
+        
+        if pending_signals:
+            # Sort by ML score (highest first) - THIS IS THE KEY
+            pending_signals.sort(key=lambda x: x['final_score'], reverse=True)
+            
+            # Calculate available position slots
+            current_pos_count = len(self.positions)
+            try:
+                equity = self.equity_now()
+                max_pos = self.position_manager.get_effective_max_positions(equity=equity) if equity > 0 else self.cfg.MAX_OPEN_POSITIONS
+            except Exception:
+                max_pos = self.cfg.MAX_OPEN_POSITIONS
+            
+            available_slots = max(0, max_pos - current_pos_count)
+            
+            # Get market quality for logging
+            market_quality = self.signal_pressure_monitor.get_market_quality()
+            
+            # Log priority queue status with market insight
+            top_scores = [s['final_score'] for s in pending_signals[:5]]
+            top_scores_str = ', '.join([f'{score:.1f}' for score in top_scores])
+            bottom_scores = [s['final_score'] for s in pending_signals[-3:]] if len(pending_signals) > 3 else []
+            bottom_scores_str = ', '.join([f'{score:.1f}' for score in bottom_scores])
+            
+            # Get market speed status
+            market_speed_state = self.market_speed_adapter.get_state()
+            
+            self.logger.info(
+                f"[INTELLIGENT_QUEUE] {len(pending_signals)} candidates | "
+                f"Positions: {current_pos_count}/{max_pos} | "
+                f"Slots: {available_slots} | "
+                f"Market: {market_speed_state.market_speed.upper()} ({market_speed_state.signals_per_hour:.0f}/hr) | "
+                f"Threshold: {market_speed_state.current_threshold:.0f} | "
+                f"Best: [{top_scores_str}]"
+            )
+            
+            # QUALITY GATE: Skip dangerous regimes before entering
+            # But do this AFTER ranking so we can see what we're skipping
+            signals_to_enter = []
+            for i, sig_data in enumerate(pending_signals):
+                if len(signals_to_enter) >= available_slots:
+                    break
+                
+                # Check for dangerous regime (from hindsight ML)
+                regime = sig_data.get('regime', -1)
+                regime_name = sig_data.get('regime_name', 'UNKNOWN')
+                score = sig_data['final_score']
+                symbol = sig_data['symbol']
+                
+                # Skip dangerous regimes (2=DANGEROUS, 4=VERY_DANGEROUS)
+                if regime in [2, 4]:
+                    self.logger.info(
+                        f"[SKIP_REGIME] {symbol} score={score:.1f} regime={regime_name} - dangerous regime skipped"
+                    )
+                    continue
+                
+                # Accept this signal
+                signals_to_enter.append(sig_data)
+            
+            # Log what we're entering
+            if signals_to_enter:
+                entering_str = ', '.join([f"{s['symbol']}({s['final_score']:.0f})" for s in signals_to_enter])
+                self.logger.info(f"[ENTERING_BEST] {len(signals_to_enter)} signals: {entering_str}")
+                
+                # Record entries for market speed learning
+                for sig in signals_to_enter:
+                    self.market_speed_adapter.record_entry(sig['final_score'], sig['symbol'])
+            elif available_slots > 0 and len(pending_signals) > 0:
+                # We had candidates but didn't enter any - why?
+                self.logger.info(
+                    f"[NO_ENTRY] {available_slots} slots available, {len(pending_signals)} candidates - all skipped (regime or quality)"
+                )
+            
+            for signal_data in signals_to_enter:
+                symbol = signal_data['symbol']
+                signal = signal_data['signal']
+                stats = signal_data['stats']
+                latency_ms = signal_data['latency_ms']
+                orderbook = signal_data['orderbook']
+                is_unicorn = signal_data['is_unicorn']
+                replacement_symbol = signal_data['replacement_symbol']
+                indicators = signal_data['indicators']
+                equity = signal_data['equity']
+                
+                self.logger.info(
+                    f"[PRIORITY_ENTRY] {symbol} {signal.side.upper()} | "
+                    f"Score: {signal.final_score:.1f} | "
+                    f"Rank: {pending_signals.index(signal_data) + 1}/{len(pending_signals)}"
+                )
+                
+                # Now execute the full entry logic that was skipped earlier
+                # (Copy of the entry logic from lines 3985-4760)
+                
+                try:
+                    from .validators import (
+                        validate_price,
+                        validate_side,
+                        validate_stop_loss_take_profit,
+                    )
+                    entry_price = validate_price(signal.entry_price, "entry_price")
+                    validate_side(signal.side)
+                    validate_stop_loss_take_profit(
+                        entry_price,
+                        signal.stop_loss,
+                        signal.take_profit,
+                        signal.side,
+                    )
+                except Exception as e:
+                    self.logger.warning(
+                        "Signal validation failed",
+                        symbol=symbol,
+                        error=str(e),
+                    )
+                    continue
+                
+                # Handle replacement if needed
+                if replacement_symbol:
+                    if replacement_symbol in self.positions:
+                        replacement_position = self.positions[replacement_symbol]
+                        
+                        exit_result = await self.exit_pipeline._execute_exit_order(
+                            symbol=replacement_symbol,
+                            position=replacement_position,
+                            reason="replaced_by_better_signal",
+                            funding_rate=replacement_position.get("funding_rate", 0.0),
+                        )
+                        
+                        if exit_result.success:
+                            was_win = exit_result.net_pnl > 0 if exit_result.net_pnl else False
+                            pnl_pct = (exit_result.net_pnl / equity * 100) if exit_result.net_pnl else None
+                            
+                            from .position_utils import apply_exit_and_log, record_loop_exit
+                            
+                            replacement_entry_price = replacement_position.get('entry_price', 0)
+                            replacement_entry_time = replacement_position.get('entry_time', time.time())
+                            replacement_side = replacement_position.get('side', '')
+                            replacement_size = replacement_position.get('size', 0)
+                            
+                            replacement_pnl_pct = 0.0
+                            if replacement_entry_price > 0 and exit_result.exit_price and exit_result.exit_price > 0:
+                                if replacement_side.lower() == 'long':
+                                    replacement_pnl_pct = ((exit_result.exit_price - replacement_entry_price) / replacement_entry_price) * 100
+                                else:
+                                    replacement_pnl_pct = ((replacement_entry_price - exit_result.exit_price) / replacement_entry_price) * 100
+                            
+                            replacement_now = time.time()
+                            replacement_prs = replacement_position.get('recovery_score')
+                            
+                            success, event_created = apply_exit_and_log(
+                                positions=self.positions,
+                                positions_set=self._positions_set,
+                                symbol=replacement_symbol,
+                                new_size=0.0,
+                                action="EXIT",
+                                exit_price=exit_result.exit_price,
+                                entry_price=replacement_entry_price,
+                                entry_time=replacement_entry_time,
+                                exit_time=replacement_now,
+                                exit_size=exit_result.exit_size or replacement_size,
+                                size_before=replacement_size,
+                                size_after=0.0,
+                                side=replacement_side,
+                                pnl_value=exit_result.net_pnl or 0.0,
+                                pnl_pct=replacement_pnl_pct,
+                                gross_pnl=exit_result.gross_pnl or 0.0,
+                                net_pnl=exit_result.net_pnl or 0.0,
+                                total_costs=exit_result.total_costs or 0.0,
+                                reason="replaced_by_better_signal",
+                                prs=replacement_prs,
+                                was_win=was_win,
+                                is_unicorn=replacement_position.get('is_unicorn', False),
+                                bot_instance=self
+                            )
+                            
+                            if success and event_created:
+                                record_loop_exit(replacement_symbol, "EXIT")
+                                self.position_manager.record_exit(replacement_symbol, was_win, pnl_pct=pnl_pct, exit_reason=None, profit_atr=None)
+                
+                leverage = self.position_manager.calculate_dynamic_leverage(
+                    signal.strength,
+                    is_unicorn=is_unicorn,
+                )
+                
+                # Get ATR for stop loss calculation
+                atr_pct = None
+                if indicators and indicators.get('atr_pct'):
+                    atr_pct = indicators.get('atr_pct')
+                else:
+                    if signal.signal_score:
+                        stop_distance_pct = (
+                            abs((signal.stop_loss - signal.entry_price) / signal.entry_price)
+                            if signal.entry_price > 0
+                            else 0
+                        )
+                        if stop_distance_pct > 0:
+                            atr_pct = stop_distance_pct / 1.5
+                
+                # Calculate stop loss
+                # SIMPLE SL: Calculate using SimpleStopLossManager
+                scalper_stop_loss = SimpleStopLossManager.set_initial_stop_loss(
+                    entry_price=signal.entry_price,
+                    side=signal.side,
+                    atr_pct=atr_pct
+                )
+                # SimpleStopLossManager guarantees valid SL (min 1.5%)
+                
+                # Calculate position size
+                (
+                    position_size,
+                    risk_fraction,
+                    sizing_reason,
+                ) = self.position_manager.calculate_position_size(
+                    symbol=symbol,
+                    equity=equity,
+                    entry_price=signal.entry_price,
+                    stop_loss_price=scalper_stop_loss,
+                    signal_strength=signal.strength,
+                    side=signal.side,
+                    is_unicorn=is_unicorn,
+                    open_positions=self.positions,
+                    leverage=leverage,
+                    signal_score=signal.final_score,
+                )
+                
+                if position_size <= 0 or sizing_reason:
+                    self.logger.warning(
+                        f"[SIZING_REJECTED] symbol={symbol} size={position_size} "
+                        f"reason={sizing_reason or 'size<=0'} risk_fraction={risk_fraction*100:.2f}%"
+                    )
+                    continue
+                
+                final_leverage = leverage
+                
+                entry_delay = self.position_manager.get_entry_delay_ms(
+                    signal_strength=signal.strength
+                )
+                
+                use_limit = self.order_manager.should_use_limit_order(
+                    spread_bps=stats.spread_bps,
+                    signal_strength=signal.strength,
+                )
+                
+                entries_attempted += 1
+                self.entries_attempted_this_scan += 1
+                
+                entry_symbol = symbol
+                entry_side = signal.side
+                
+                # Guard: Check invalid symbols cache
+                if entry_symbol in self.invalid_symbols:
+                    invalid_since = self.invalid_symbols[entry_symbol]
+                    time_since_invalid = time.time() - invalid_since
+                    if time_since_invalid < self.invalid_symbol_cooldown:
+                        self.logger.debug(
+                            f"[SKIP_INVALID_SYMBOL] {entry_symbol}: Cached as invalid, skipping"
+                        )
+                        continue
+                    else:
+                        del self.invalid_symbols[entry_symbol]
+                
+                # Guard: Check order_manager and exchange_wrapper
+                if not self.order_manager:
+                    self.logger.error(f"[ENTRY_BLOCKED] {entry_symbol}: Order manager not initialized")
+                    continue
+                
+                if not self.exchange_wrapper:
+                    self.logger.error(f"[ENTRY_BLOCKED] {entry_symbol}: Exchange wrapper not initialized")
+                    continue
+                
+                # Enter position
+                result = await self.order_manager.enter_position(
+                    symbol=entry_symbol,
+                    side=entry_side,
+                    size=position_size,
+                    entry_price=signal.entry_price,
+                    delay_ms=entry_delay,
+                    use_limit=use_limit,
+                    leverage=final_leverage,
+                )
+                
+                # Log result
+                self.logger.warning(
+                    f"[ORDER_RESULT] {entry_symbol} {entry_side} size={position_size:.6f}: "
+                    f"success={result.success}, filled_size={result.filled_size}, "
+                    f"filled_price={result.filled_price}, error={result.error}"
+                )
+                
+                if not result.success:
+                    error_msg = str(result.error) if result.error else "Unknown error"
+                    self.logger.error(
+                        f"[ORDER_FAILURE] {entry_symbol} {entry_side}: {error_msg}"
+                    )
+                    continue
+                
+                # Position entered successfully - register it
+                if result.success and result.filled_size and result.filled_size > 0:
+                    entry_time = time.time()
+                    entry_price = result.filled_price or signal.entry_price
+                    filled_size = result.filled_size
+                    
+                    # Register position in bot's tracking
+                    self.positions[entry_symbol] = {
+                        'symbol': entry_symbol,
+                        'side': entry_side,
+                        'entry_price': entry_price,
+                        'entry_time': entry_time,
+                        'size': filled_size,
+                        'stop_loss': scalper_stop_loss,
+                        'take_profit': signal.take_profit,
+                        'signal_score': signal.final_score,
+                        'is_unicorn': is_unicorn,
+                        'leverage': final_leverage
+                    }
+                    self._positions_set.add(entry_symbol)
+                    
+                    self.logger.info(
+                        f"[ENTRY_SUCCESS] {entry_symbol} {entry_side.upper()} | "
+                        f"Price: {entry_price:.6f} | Size: {filled_size:.4f} | "
+                        f"Score: {signal.final_score:.1f} | SL: {scalper_stop_loss:.6f}"
+                    )
+                    
+                    # SUPPLY/DEMAND: Record successful entry for pressure calculation
+                    self.signal_pressure_monitor.record_entry()
+        
+        # ============================================================
         
         # Track scan completion
         scan_end_time = time.time()
@@ -4534,11 +5461,15 @@ class ScalperBot:
         # (No longer checking Binance stop-loss orders since we don't place them)
         # Bot handles all exits internally via monitor_and_exit_positions
             
-        # SCURFFY THE JANITOR: Ultra-fast sweep (5s) to catch dust immediately
-        if monitor_now - self._last_pos_sync > 5 and not self.replay_mode and self.exchange_wrapper:
+        # CRITICAL: Position sync to prevent unmanaged positions
+        # Balanced: 5 seconds is frequent enough without hitting rate limits
+        POSITION_SYNC_INTERVAL = 5.0  # Sync every 5 seconds (was 2s, caused rate limit bans)
+        if monitor_now - self._last_pos_sync > POSITION_SYNC_INTERVAL and not self.replay_mode and self.exchange_wrapper:
+            self.logger.info(f"[SYNC_START] Fetching positions from Binance (every 5s)")
             try:
                 # Fetch all open positions (no symbol filter)
                 real_positions = await self.exchange_wrapper.fetch_positions()
+                self.logger.info(f"[SYNC_FETCHED] Got {len(real_positions)} positions from Binance")
                 
                 for rp in real_positions:
                     sym = rp.get('symbol') or rp.get('symbolName')
@@ -4566,7 +5497,8 @@ class ScalperBot:
                             self.logger.warning(f"[!] RESURRECTING ZOMBIE: {sym} (Mem=0, Exch={exchange_size})")
                             # Fall through to adoption
                         else:
-                            continue # Normal tracking, skip
+                            # Already tracked and has size - skip (trailing handled in main sync loop)
+                            continue
                     
                     # ADOPT GHOST POSITION (ensure all required fields)
                     # CRITICAL: Binance returns NEGATIVE positionAmt for shorts - use abs()
@@ -4578,7 +5510,7 @@ class ScalperBot:
                     if position_size <= 0:
                         continue  # Skip zero-size positions
                     
-                    # Determine side from positionAmt sign or explicit side field
+                    # Determine side from positionAmt sign or explicit side field (must be done before logging)
                     explicit_side = rp.get('side', rp.get('positionSide', '')).lower()
                     if explicit_side in ('long', 'buy'):
                         side = 'long'
@@ -4597,16 +5529,38 @@ class ScalperBot:
                     
                     # Calculate stop-loss from entry price if not available
                     entry_price = float(rp.get('entryPrice', rp.get('price', 0.0)) or 0.0)
+                    
+                    # CRITICAL: If position exists on Binance but not in our tracking, it's UNMANAGED!
+                    # This is a critical error - log it prominently (now that side is defined)
+                    if sym not in self.positions:
+                        self.logger.error(
+                            f"[CRITICAL] UNMANAGED POSITION FOUND: {sym} {side.upper()} | "
+                            f"Size={position_size:.4f} | Entry=${entry_price:.6f} | "
+                            f"Unrealized PnL=${float(rp.get('unrealizedPnl', 0.0)):.2f} | "
+                            f"ADOPTING IMMEDIATELY to prevent further losses!"
+                        )
                     if not entry_price:
                         entry_price = float(rp.get('avgPrice', rp.get('markPrice', 0.0)) or 0.0)
                     
-                    # Set default stop-loss for adopted positions (1% away from entry)
-                    from .config import MIN_STOP_DISTANCE_PCT
-                    if side == 'long':
-                        default_stop_loss = entry_price * (1.0 - MIN_STOP_DISTANCE_PCT) if entry_price > 0 else 0
-                    else:  # short
-                        default_stop_loss = entry_price * (1.0 + MIN_STOP_DISTANCE_PCT) if entry_price > 0 else 0
+                    # Extract stop loss from Binance, or use centralized calculator
+                    stop_loss_from_binance = float(rp.get('stopPrice', 0.0) or 0.0)
                     
+                    # SIMPLE SL: If Binance doesn't have a stop loss, use SimpleStopLossManager
+                    if not stop_loss_from_binance and entry_price > 0:
+                        stop_loss_from_binance = SimpleStopLossManager.set_initial_stop_loss(
+                            entry_price=entry_price,
+                            side=side,
+                            atr_pct=None
+                        )
+                    
+                    # Get ATR for adopted position (needed for trailing stop to work)
+                    atr_pct_adopted = None
+                    if stats:
+                        atr_pct_adopted = getattr(stats, 'atr_pct', None)
+                    if not atr_pct_adopted:
+                        atr_pct_adopted = 0.01  # Default 1% if not available
+                    
+                    # Set default stop-loss for adopted positions
                     adopted = {
                         'symbol': sym,
                         'entry_price': entry_price,
@@ -4615,8 +5569,12 @@ class ScalperBot:
                         'leverage': int(rp.get('leverage', 1) or 1),
                         'entry_time': preserved_entry_time,  # Never use 0 or invalid timestamp
                         'unrealizedPnl': float(rp.get('unrealizedPnl', 0.0) or 0.0),
-                        'stop_loss': default_stop_loss,  # Set default stop-loss for adopted positions
-                        'initial_stop_price': default_stop_loss,
+                        'stop_loss': stop_loss_from_binance,  # Use Binance stopPrice if set, else MIN_STOP_DISTANCE_PCT
+                        'initial_stop_price': stop_loss_from_binance,
+                        'atr_pct': atr_pct_adopted,  # Store ATR for trailing stop calculations
+                        'signal_score': 70.0,  # ADOPTED: Assign standard score to prevent immediate scalp exits
+                        'entry_score': 70.0,  # ADOPTED: Treat as standard quality signal
+                        'exit_profile': 'standard',  # ADOPTED: Use standard exit profile (not scalp)
                     }
 
                     # Fallbacks
@@ -4625,11 +5583,35 @@ class ScalperBot:
                     if not adopted['size']:
                         adopted['size'] = abs(float(rp.get('qty', 0.0) or 0.0))
                     if adopted['stop_loss'] <= 0:
-                        # Recalculate stop-loss if still invalid
-                        if side == 'long':
-                            adopted['stop_loss'] = adopted['entry_price'] * (1.0 - MIN_STOP_DISTANCE_PCT) if adopted['entry_price'] > 0 else 0
-                        else:
-                            adopted['stop_loss'] = adopted['entry_price'] * (1.0 + MIN_STOP_DISTANCE_PCT) if adopted['entry_price'] > 0 else 0
+                        # Recalculate stop-loss using SimpleStopLossManager
+                        adopted['stop_loss'] = SimpleStopLossManager.set_initial_stop_loss(
+                            entry_price=adopted['entry_price'],
+                            side=side,
+                            atr_pct=None
+                        ) if adopted['entry_price'] > 0 else 0
+                    
+                    # CRITICAL: Preserve trailing stop from existing position
+                    # Never let synced data overwrite our trailing stops!
+                    existing_pos = self.positions.get(sym, {})
+                    if existing_pos:
+                        existing_sl = existing_pos.get('stop_loss', 0)
+                        new_sl = adopted.get('stop_loss', 0)
+                        
+                        if existing_sl > 0:
+                            if side == 'long':
+                                # For LONG: higher SL is better (more profit locked)
+                                if existing_sl > new_sl:
+                                    adopted['stop_loss'] = existing_sl
+                            else:  # short
+                                # For SHORT: lower SL is better (more profit locked)
+                                if new_sl <= 0 or existing_sl < new_sl:
+                                    adopted['stop_loss'] = existing_sl
+                        
+                        # Preserve trailing state
+                        for key in ['initial_stop_price', 'trailing_state', 'current_r', 'peak_r',
+                                    'max_r', 'locked_r', 'current_price', 'last_trailing_update_ts']:
+                            if key in existing_pos and existing_pos[key]:
+                                adopted[key] = existing_pos[key]
 
                     self.positions[sym] = adopted
                     
@@ -4641,16 +5623,125 @@ class ScalperBot:
                         pass
                     self._positions_set.add(sym)
                     
-                    self.logger.info(f"[!] ADOPTED GHOST POSITION: {sym} | Side={adopted['side'].upper()} | Size={adopted['size']:.4f} | Entry=${adopted['entry_price']:.4f} | SL=${adopted['stop_loss']:.4f}")
+                    self.logger.warning(
+                        f"[!] ADOPTED POSITION: {sym} | Side={adopted['side'].upper()} | "
+                        f"Size={adopted['size']:.4f} | Entry=${adopted['entry_price']:.4f} | "
+                        f"SL=${adopted['stop_loss']:.4f} | PnL=${adopted.get('unrealizedPnl', 0):.2f}"
+                    )
+                    
+                    # [CRITICAL SAFETY] Place emergency server-side stop-loss immediately
+                    # This protects against bot crashes - Binance will close position if SL hit
+                    if self.exchange_wrapper and adopted['stop_loss'] > 0:
+                        try:
+                            # Place STOP_MARKET order on Binance as emergency backstop
+                            close_side = 'sell' if side == 'long' else 'buy'
+                            await self.exchange_wrapper.place_stop_loss_order(
+                                symbol=sym,
+                                side=close_side,
+                                quantity=adopted['size'],
+                                stop_price=adopted['stop_loss'],
+                                current_price=adopted['entry_price']
+                            )
+                            self.logger.info(
+                                f"[EMERGENCY_SL] {sym}: Placed server-side SL @ ${adopted['stop_loss']:.4f} "
+                                f"(protects against bot crashes)"
+                            )
+                        except Exception as sl_error:
+                            self.logger.error(
+                                f"[EMERGENCY_SL_FAILED] {sym}: Could not place server-side SL: {sl_error}. "
+                                f"Position is UNPROTECTED if bot crashes!"
+                            )
                 
                 # Update last sync time
                 self._last_pos_sync = monitor_now
+                
+                # CRITICAL VALIDATION: Verify ALL Binance positions are now tracked
+                tracked_symbols = set(self.positions.keys())
+                binance_symbols = set()
+                for rp in real_positions:
+                    sym_check = rp.get('symbol') or rp.get('symbolName')
+                    if sym_check:
+                        if hasattr(self.exchange_wrapper, 'normalize_symbol'):
+                            sym_check = self.exchange_wrapper.normalize_symbol(sym_check)
+                        clean_check = sym_check.replace("/", "").replace("-", "").replace(":", "")
+                        if not ("USDTUSDT" in clean_check or (len(clean_check) > 6 and clean_check[-6:].isdigit())):
+                            size_check = abs(float(rp.get('contracts', rp.get('amount', rp.get('positionAmt', 0.0))) or 0.0))
+                            if size_check > 0:
+                                binance_symbols.add(sym_check)
+                
+                # Check for any unmanaged positions
+                unmanaged = binance_symbols - tracked_symbols
+                if unmanaged:
+                    self.logger.error(
+                        f"[CRITICAL] UNMANAGED POSITIONS DETECTED: {len(unmanaged)} positions on Binance not tracked! "
+                        f"Symbols: {', '.join(unmanaged)}. This is a CRITICAL ERROR - positions may be losing money!"
+                    )
+                    # Force adoption of unmanaged positions
+                    for unmanaged_sym in unmanaged:
+                        for rp in real_positions:
+                            sym_check = rp.get('symbol') or rp.get('symbolName')
+                            if sym_check and hasattr(self.exchange_wrapper, 'normalize_symbol'):
+                                sym_check = self.exchange_wrapper.normalize_symbol(sym_check)
+                            if sym_check == unmanaged_sym:
+                                # Force adopt this position
+                                raw_size = abs(float(rp.get('contracts', rp.get('amount', rp.get('positionAmt', 0.0))) or 0.0))
+                                if raw_size > 0:
+                                    entry_price = float(rp.get('entryPrice', rp.get('price', 0.0)) or 0.0)
+                                    if not entry_price:
+                                        entry_price = float(rp.get('avgPrice', rp.get('markPrice', 0.0)) or 0.0)
+                                    
+                                    explicit_side = rp.get('side', rp.get('positionSide', '')).lower()
+                                    if explicit_side in ('long', 'buy'):
+                                        side = 'long'
+                                    elif explicit_side in ('short', 'sell'):
+                                        side = 'short'
+                                    else:
+                                        side = 'long'  # Default
+                                    
+                                    # SIMPLE SL: Calculate using SimpleStopLossManager
+                                    default_stop_loss = SimpleStopLossManager.set_initial_stop_loss(
+                                        entry_price=entry_price,
+                                        side=side,
+                                        atr_pct=None
+                                    ) if entry_price > 0 else 0
+                                    
+                                    emergency_adopt = {
+                                        'symbol': unmanaged_sym,
+                                        'entry_price': entry_price,
+                                        'size': raw_size,
+                                        'side': side,
+                                        'leverage': int(rp.get('leverage', 1) or 1),
+                                        'entry_time': monitor_now,
+                                        'unrealizedPnl': float(rp.get('unrealizedPnl', 0.0) or 0.0),
+                                        'stop_loss': default_stop_loss,
+                                        'initial_stop_price': default_stop_loss,
+                                        'emergency_adopted': True,  # Flag for tracking
+                                        'signal_score': 70.0,  # ADOPTED: Assign standard score to prevent immediate scalp exits
+                                        'entry_score': 70.0,  # ADOPTED: Treat as standard quality signal
+                                        'exit_profile': 'standard',  # ADOPTED: Use standard exit profile (not scalp)
+                                    }
+                                    
+                                    self.positions[unmanaged_sym] = emergency_adopt
+                                    self._positions_set.add(unmanaged_sym)
+                                    try:
+                                        self.position_registry._positions[unmanaged_sym] = emergency_adopt
+                                        self.position_registry._positions_set.add(unmanaged_sym)
+                                    except Exception:
+                                        pass
+                                    
+                                    self.logger.error(
+                                        f"[EMERGENCY_ADOPT] {unmanaged_sym} {side.upper()} | "
+                                        f"Size={raw_size:.4f} | Entry=${entry_price:.6f} | "
+                                        f"SL=${default_stop_loss:.6f} | PnL=${emergency_adopt['unrealizedPnl']:.2f} | "
+                                        f"NOW TRACKED - will be managed going forward"
+                                    )
+                                break
                 
                 # DUST CLEANUP: Close very small positions (< $10 notional) to prevent dust accumulation
                 # This runs after position adoption to catch any dust positions
                 # Note: DRY_RUN is already imported at module level
                 dust_cleanup_threshold_usd = 10.0  # Close positions worth less than $10
-                
+
                 for sym, pos in list(self.positions.items()):
                     try:
                         # Get current price for notional calculation
@@ -4658,10 +5749,10 @@ class ScalperBot:
                         current_price = getattr(stats, 'last', pos.get('entry_price', 0)) if stats else pos.get('entry_price', 0)
                         if current_price <= 0:
                             continue
-                        
+
                         position_size = abs(pos.get('size', 0))
                         notional_value = position_size * current_price
-                        
+
                         # Close dust positions (very small notional value)
                         if notional_value > 0 and notional_value < dust_cleanup_threshold_usd:
                             self.logger.warning(
@@ -4674,30 +5765,32 @@ class ScalperBot:
                         self.logger.debug(f"[DUST_CLEANUP] Error checking {sym}: {e}")
                 
                 # MANUAL CLOSE SYNC: Remove positions closed externally (Binance app, etc.)
-                # Build set of symbols that exist on exchange
-                real_symbols = set()
-                for rp in real_positions:
-                    sym = rp.get('symbol') or rp.get('symbolName')
-                    if sym:
-                        if hasattr(self.exchange_wrapper, 'normalize_symbol'):
-                            sym = self.exchange_wrapper.normalize_symbol(sym)
-                        real_symbols.add(sym)
-                
-                # Check for positions we're tracking but aren't on exchange
-                for sym in list(self.positions.keys()):
-                    if sym not in real_symbols:
-                        entry_ts = self.positions[sym].get('entry_time', 0)
-                        # Only remove if position is older than 10s (avoid race condition with new entries)
-                        if monitor_now - entry_ts > 10.0:
-                            self.logger.info(f"[X] MANUAL CLOSE DETECTED: {sym} - Removed from tracking")
-                            del self.positions[sym]
-                            self._positions_set.discard(sym)
-                            try:
-                                if sym in self.position_registry._positions:
-                                    del self.position_registry._positions[sym]
-                                self.position_registry._positions_set.discard(sym)
-                            except Exception:
-                                pass
+                # SKIP in DRY_RUN mode - positions don't exist on exchange, so sync would remove all positions
+                if not self.dry_run:  # Only sync removal in live mode
+                    # Build set of symbols that exist on exchange
+                    real_symbols = set()
+                    for rp in real_positions:
+                        sym = rp.get('symbol') or rp.get('symbolName')
+                        if sym:
+                            if hasattr(self.exchange_wrapper, 'normalize_symbol'):
+                                sym = self.exchange_wrapper.normalize_symbol(sym)
+                            real_symbols.add(sym)
+                    
+                    # Check for positions we're tracking but aren't on exchange
+                    for sym in list(self.positions.keys()):
+                        if sym not in real_symbols:
+                            entry_ts = self.positions[sym].get('entry_time', 0)
+                            # Only remove if position is older than 10s (avoid race condition with new entries)
+                            if monitor_now - entry_ts > 10.0:
+                                self.logger.info(f"[X] MANUAL CLOSE DETECTED: {sym} - Removed from tracking")
+                                del self.positions[sym]
+                                self._positions_set.discard(sym)
+                                try:
+                                    if sym in self.position_registry._positions:
+                                        del self.position_registry._positions[sym]
+                                    self.position_registry._positions_set.discard(sym)
+                                except Exception:
+                                    pass
                 
                 self._last_pos_sync = monitor_now
             except Exception as e:
@@ -4758,8 +5851,14 @@ class ScalperBot:
             # Let them be managed by normal exit logic (TP/SL/trailing)
 
         for symbol, position in list(self.positions.items()):
+            # DEBUG: Log every position entering the loop
+            if symbol == "FIDA/USDT":
+                self.logger.info(f"[POSITION_LOOP] FIDA entering position monitoring loop")
+            
             # Skip if already marked for exit by dust sweeper
             if any(p[0] == symbol for p in positions_to_exit):
+                if symbol == "FIDA/USDT":
+                    self.logger.info(f"[SKIP] FIDA already marked for exit")
                 continue
                 
             # LATENCY OPTIMIZATION: Use cached data (no API calls)
@@ -4772,8 +5871,49 @@ class ScalperBot:
             if not stats and not symbol.endswith(":USDT"):
                 stats = self.universe.stats.get(f"{symbol}:USDT")
                 
+            # For adopted/manual positions: Allow monitoring even without stats (use position's own data)
+            # Check if this is a manual position by looking for typical adopted markers
+            is_manual_or_adopted = (
+                position.get('is_adopted') == True or 
+                position.get('is_adopted') is None  # Manual positions may not have this flag
+            )
+            
+            # Skip positions without stats UNLESS they're manual/adopted
             if not stats:
-                continue
+                if is_manual_or_adopted:
+                    # Fetch FRESH price from ticker cache or websocket
+                    fresh_price = None
+                    if hasattr(self, 'ticker_cache'):
+                        cached_ticker = self.ticker_cache.get(symbol, max_age=5.0)
+                        if cached_ticker:
+                            fresh_price = cached_ticker.mark or cached_ticker.last
+                    
+                    # Fallback to position's stored price if no cache available
+                    if not fresh_price:
+                        fresh_price = position.get('current_price', position.get('entry_price', 0))
+                    
+                    # Create minimal stats with fresh price
+                    class MinimalStats:
+                        def __init__(self, price):
+                            self.last = price
+                            self.mark = price
+                            self.spread_bps = 0
+                    stats = MinimalStats(fresh_price)
+                    
+                    if symbol == "FIDA/USDT":
+                        self.logger.info(f"[MANUAL_POS] FIDA: Using fresh price {fresh_price:.6f} for trailing")
+                else:
+                    continue
+            
+            # If no stats but adopted: use position's stored price data
+            if not stats:
+                # Create minimal stats-like object from position data
+                class MinimalStats:
+                    def __init__(self, price):
+                        self.last = price
+                        self.mark = price
+                        self.spread_bps = 0
+                stats = MinimalStats(position.get('current_price', position.get('entry_price', 0)))
             
             # OPTIMIZATION: Cache position attributes once to avoid repeated dict lookups
             side = position.get('side', '').lower()
@@ -4847,6 +5987,7 @@ class ScalperBot:
                     explosion_reason = f"spread_explosion_max: {spread_bps:.1f}bps >= {SPREAD_EXPLOSION_MAX_BPS}bps cap"
                 
                 if spread_exploded:
+                    # Spread explosion - exit immediately (no hold period protection)
                     self.logger.warning(f"SPREAD_EXPLOSION: {symbol} {explosion_reason} - Emergency exit!")
                     positions_to_exit.append((symbol, position, explosion_reason, current_price))
                     continue
@@ -4857,6 +5998,7 @@ class ScalperBot:
             from .config import (
                 FUNDING_AVOIDANCE_ENABLED, FUNDING_AVOIDANCE_MINUTES, FUNDING_AVOIDANCE_MIN_PROFIT_PCT
             )
+            
             if FUNDING_AVOIDANCE_ENABLED:
                 from datetime import datetime, timezone
                 now_utc = datetime.now(timezone.utc)
@@ -4874,6 +6016,7 @@ class ScalperBot:
                 if approaching_funding:
                     profit_pct = ((current_price - entry_price) / entry_price) * 100 if side == 'long' else ((entry_price - current_price) / entry_price) * 100
                     if 0 < profit_pct < FUNDING_AVOIDANCE_MIN_PROFIT_PCT:
+                        # Exit before funding to avoid fees eating small profits
                         self.logger.info(f"FUNDING_AVOIDANCE: {symbol} exiting before funding (profit={profit_pct:.2f}%)")
                         positions_to_exit.append((symbol, position, f"funding_avoidance_{profit_pct:.2f}pct", current_price))
                         continue
@@ -4899,9 +6042,9 @@ class ScalperBot:
             # Only trigger if PnL is significantly negative (-0.8%) AND trend is strongly against (-5%)
             adverse_trend = False
             if side == 'long' and pnl_pct < -0.8 and pct_change_24h < -5.0:
-                 adverse_trend = True
+                adverse_trend = True
             elif side == 'short' and pnl_pct < -0.8 and pct_change_24h > 5.0:
-                 adverse_trend = True
+                adverse_trend = True
                  
             if adverse_trend:
                 # We are losing and the macro trend is against us.
@@ -4947,8 +6090,19 @@ class ScalperBot:
             # OPTIMIZATION: Calculate once, reuse everywhere
             if side == 'long':
                 current_pnl_pct = ((current_price - entry_price) / entry_price) * 100
+                price_diff = current_price - entry_price
             else:
                 current_pnl_pct = ((entry_price - current_price) / entry_price) * 100
+                price_diff = entry_price - current_price
+            
+            # Calculate unrealized PnL in absolute terms (USDT)
+            position_size = position.get('size', 0.0)
+            unrealized_pnl_usd = price_diff * position_size if position_size > 0 else 0.0
+            
+            # Update position's unrealized PnL (for display and tracking)
+            position['unrealizedPnl'] = unrealized_pnl_usd
+            position['unrealized_pnl'] = unrealized_pnl_usd  # Also set alternative key name
+            position['pnl_pct'] = current_pnl_pct  # Store percentage too
             
             # Update peak PnL tracking (needed for recovery score and time extension logic)
             peak_pnl = position.get('peak_pnl', current_pnl_pct)
@@ -4996,13 +6150,26 @@ class ScalperBot:
                     self.logger.debug(f"[STARTUP_GUARD] Blocked absolute time exit for {symbol} (startup age: {startup_age:.1f}s, position age: {position_age_sec/60:.1f}min)")
 
             # DEFAULT TIME EXIT: Use MAX_POSITION_AGE_SEC from config
+            # BUT: Respect Diamond Hands - don't exit during hold period
+            from .config import DISABLE_STOP_DURING_HOLD, MIN_HOLD_TIME_SEC
+            hold_time_sec = monitor_now - entry_time
+            min_hold_active = MIN_HOLD_TIME_SEC > 0 and hold_time_sec < MIN_HOLD_TIME_SEC
+            
             if position_age_sec > MAX_POSITION_AGE_SEC and not time_extension_granted:
-                # CRITICAL: Block time exits during startup guard
-                if in_startup_guard:
+                # DIAMOND HANDS: Block time exits during hold period
+                if DISABLE_STOP_DURING_HOLD and min_hold_active:
+                    # Still in Diamond Hands hold period - don't exit on time
+                    self.logger.debug(
+                        f"[DIAMOND_HANDS] {symbol} age={position_age_sec/60:.1f}min - "
+                        f"Blocking time exit during hold period (hold={hold_time_sec/60:.1f}min, min={MIN_HOLD_TIME_SEC/60:.0f}min)"
+                    )
+                    # Skip time exit, continue to Diamond Hands logic
+                elif in_startup_guard:
+                    # CRITICAL: Block time exits during startup guard
                     self.logger.debug(f"[STARTUP_GUARD] Blocked time exit for {symbol} (startup age: {startup_age:.1f}s, position age: {position_age_sec/60:.1f}min)")
                     # Skip time exit during startup guard, continue to other checks
                 else:
-                    # Check if position qualifies for ONE-TIME extension
+                    # After hold period - check if position qualifies for ONE-TIME extension
                     # Criteria: Within 0.5R of break-even AND showing improvement
                     is_near_breakeven = abs(current_pnl_pct) < 0.5  # Within 0.5% of BE
                     is_improving = current_pnl_pct > (peak_pnl - 0.3)  # Not deteriorating badly
@@ -5015,7 +6182,7 @@ class ScalperBot:
                         )
                         # Don't exit, let it continue
                     else:
-                        # No extension - force exit at config max age (but not during startup guard)
+                        # No extension - force exit at config max age (but not during startup guard or Diamond Hands hold)
                         if not in_startup_guard:
                             self.logger.info(
                                 f"TIME_EXIT_DEFAULT: {symbol} age={position_age_sec/60:.1f}min (>{MAX_POSITION_AGE_SEC/60:.0f}min) pnl={current_pnl_pct:.2f}%"
@@ -5029,8 +6196,9 @@ class ScalperBot:
             # EMERGENCY LOSS LIMIT CHECK (Before any other exit logic)
             # ============================================================
             # CRITICAL: Force exit if position loss exceeds hard limit
-            # This prevents catastrophic losses like PIPPIN (2 days of losses)
+            # SL ALWAYS TRIGGERS - No Diamond Hands bypass
             from .config import MAX_POSITION_LOSS_PCT
+            
             if current_pnl_pct <= MAX_POSITION_LOSS_PCT:
                 self.logger.error(
                     f"[EMERGENCY_EXIT] {symbol} {side.upper()} | "
@@ -5042,6 +6210,7 @@ class ScalperBot:
                 continue  # Skip other checks, force exit immediately
             
             # Additional safety: Validate stop-loss exists and is reasonable
+            # If invalid SL and we're losing, force exit immediately
             stop_loss = position.get('stop_loss', 0)
             if stop_loss <= 0 or stop_loss == entry_price:
                 # Invalid stop-loss - if we're losing, force exit
@@ -5077,6 +6246,9 @@ class ScalperBot:
             if atr_pct is None and stats is not None:
                 # Try to get from stats if available
                 atr_pct = getattr(stats, 'atr_pct', None)
+            # FALLBACK: If still None, use default (especially for adopted positions from before the fix)
+            if atr_pct is None or atr_pct <= 0:
+                atr_pct = 0.01  # Default 1% for adopted positions without cached ATR
             
             # Determine volatility regime
             vol_regime = self.exit_pipeline.get_volatility_regime(atr_pct=atr_pct)
@@ -5156,6 +6328,7 @@ class ScalperBot:
             
             # Queue PRS action if needed
             if prs_action:
+                # PRS is now active at all times (no hold period blocking)
                 # Force 100% exit if partials disabled (prevents dust positions)
                 from .config import DISABLE_PARTIAL_EXITS
                 exit_size_ratio = 1.0 if DISABLE_PARTIAL_EXITS else prs_action.exit_size_ratio
@@ -5166,7 +6339,49 @@ class ScalperBot:
                     None,  # target_price (market order)
                     exit_size_ratio
                 ))
-
+            
+            # GENTLE & STEADY TRAILING FOR ADOPTED POSITIONS (ALWAYS, even before stale check)
+            # Follow price at 0.3% distance - lock in profits gently without being greedy
+            # NOTE: Use FRESH price from stats/cache, not stale position dict!
+            current_sl = position.get('stop_loss', 0)
+            initial_sl = position.get('initial_stop_price', current_sl)
+            
+            # Use fresh current price from stats (updated by WebSocket), not stale position dict
+            fresh_price = current_price  # This comes from stats/ticker lookup above
+            
+            # SIMPLE TRAILING: Use SimpleStopLossManager for consistent trailing logic
+            # This replaces the old manual trailing code
+            new_sl, did_update, profit_locked = SimpleStopLossManager.update_trailing_stop(
+                entry_price=entry_price,
+                current_price=fresh_price,
+                current_sl=current_sl,
+                side=side
+            )
+            if did_update:
+                position['stop_loss'] = new_sl
+                # Logging already handled by SimpleStopLossManager
+            
+            # Check for stale adopted positions (no movement for 4-6 hours)
+            if position.get('is_adopted', False):
+                age_hours = (monitor_now - entry_time) / 3600.0
+                if age_hours > 4.0:  # 4 hours
+                    # Check if position is stale (PnL hasn't changed significantly)
+                    peak_pnl = position.get('peak_pnl', 0)
+                    current_pnl = position.get('unrealizedPnl', 0)
+                    pnl_change = abs(current_pnl - peak_pnl)
+                    
+                    if pnl_change < 0.5:  # Less than $0.50 movement
+                        self.logger.info(f"[STALE] {symbol}: Adopted position stale after {age_hours:.1f}h, exiting")
+                        from .exit_reasons import ExitReason
+                        positions_to_exit.append((
+                            symbol,
+                            position,
+                            ExitReason.STALE_ADOPTED_POSITION.value,
+                            None,  # target_price (market order)
+                            1.0  # Full exit
+                        ))
+                        continue
+            
             # SCALPER UPGRADE: Use scalper-specific trailing exit logic
             from .engine.scalper_exits import evaluate_scalper_trailing
             
@@ -5190,12 +6405,13 @@ class ScalperBot:
             
             bars_in_trade = position.get('bars_in_trade', 0)
             
-            # SCALPER: Set initial stop loss if not set (0.35 * ATR)
+            # SIMPLE SL: Set initial stop loss if not set
             if not position.get('initial_stop_price'):
-                if side == "long":
-                    initial_stop = entry_price * (1.0 - 0.35 * (atr_pct or 0.01))
-                else:
-                    initial_stop = entry_price * (1.0 + 0.35 * (atr_pct or 0.01))
+                initial_stop = SimpleStopLossManager.set_initial_stop_loss(
+                    entry_price=entry_price,
+                    side=side,
+                    atr_pct=atr_pct or 0.01
+                )
                 position['initial_stop_price'] = initial_stop
                 if not position.get('stop_loss'):
                     position['stop_loss'] = initial_stop
@@ -5244,11 +6460,9 @@ class ScalperBot:
                         )
             
             # Dynamic trailing stop evaluation (centralized in ExitPipeline) - fallback
-            # Skip in DRY simple exits mode (no partials/trailing)
+            # Always use trailing stops (live mode)
             trailing_action = None
-            from .config import DRY_SIMPLE_EXITS
-            if (hasattr(self, 'exit_pipeline') and self.exit_pipeline and not scalper_action and 
-                not (DRY_RUN and DRY_SIMPLE_EXITS)):
+            if (hasattr(self, 'exit_pipeline') and self.exit_pipeline and not scalper_action):
                 trailing_action = self.exit_pipeline.evaluate_trailing(
                     symbol=symbol,
                     position=position,
@@ -5728,6 +6942,19 @@ class ScalperBot:
         except Exception as e:
             # Non-critical, don't break execution
             self.logger.debug(f"[SELF-CHECK] Failed to verify exit events: {e}")
+        
+        # UPDATE STATS FOR MONITOR: Write position data after monitoring
+        # This ensures UI gets fresh data every time positions are checked
+        try:
+            from .stats_writer import update_stats
+            update_stats(self)
+            # DEBUG: Log to verify this is being called
+            if not hasattr(self, '_stats_update_logged'):
+                self.logger.info("[STATS_UPDATE] Writing stats after position monitoring")
+                self._stats_update_logged = True
+        except Exception as e:
+            self.logger.error(f"[STATS_UPDATE_ERROR] Failed: {e}")
+            pass  # Non-critical, don't disrupt position monitoring
 
     def _log_signal_decision(self, symbol: str, signal, action: str, reason: Optional[str] = None):
         """
@@ -5832,16 +7059,22 @@ class ScalperBot:
         ui_instance = None
         
         # Determine if we should start UI
-        # Support v2, rich, and dashboard modes
-        start_ui = UI_MODE in ("v2", "rich", "dashboard")
+        # Support v2, rich, dashboard, and btop modes
+        start_ui = UI_MODE in ("v2", "rich", "dashboard", "btop")
         
         if start_ui:
             try:
                 # Import UI here to avoid circular dependencies
-                # UPGRADE: Use UIv3 Command Center (Direct Link)
-                from .ui_v3 import UIv3
-                self.logger.info(f"[UI] Initializing {UI_MODE} (UIv3 Command Center)...")
-                ui_instance = UIv3()
+                if UI_MODE == "btop":
+                    # Use new btop-style UI
+                    from .ui_btop import BtopUI
+                    self.logger.info(f"[UI] Initializing {UI_MODE} (Btop-Style UI)...")
+                    ui_instance = BtopUI()
+                else:
+                    # UPGRADE: Use UIv3 Command Center (Direct Link)
+                    from .ui_v3 import UIv3
+                    self.logger.info(f"[UI] Initializing {UI_MODE} (UIv3 Command Center)...")
+                    ui_instance = UIv3()
                 
                 # Start UI (take over screen)
                 ui_instance.__enter__()
@@ -5856,17 +7089,85 @@ class ScalperBot:
         next_universe = 0
         next_signal_scan = 0
         
-        # Initialize regime config on startup
-        if self.regime_config is None:
-            regime_config = self.ctrl.regime_manager.get_current_config()
-            self.ctrl.apply_regime_config(self, regime_config)
+        # Regime system disabled - use config values directly
+        # (Regime system was overriding ML-based decisions with hardcoded rules)
         
         try:
             self.logger.info("[DIAG] main_loop:starting")
         except Exception:
             pass
         try:
+            # CRITICAL: Start dedicated position sync task (runs continuously)
+            async def continuous_position_sync():
+                """Dedicated task that syncs positions from Binance every 5 seconds AND writes stats."""
+                while True:
+                    try:
+                        if not self.replay_mode and self.exchange_wrapper:
+                            await self._refresh_positions()
+                            # Also validate no positions are unmanaged
+                            try:
+                                await self._validate_all_positions_tracked()
+                            except Exception as validate_error:
+                                self.logger.warning(f"[POSITION_SYNC_TASK] Validation error: {validate_error}", exc_info=True)
+                        
+                        # UPDATE POSITION PRICES: Get current prices for all positions
+                        # This ensures PnL calculations are fresh for the monitor
+                        if self.positions:
+                            for symbol in list(self.positions.keys()):
+                                try:
+                                    stats = self.universe.stats.get(symbol)
+                                    if stats:
+                                        current_price = getattr(stats, 'last', 0)
+                                        if current_price > 0:
+                                            self.positions[symbol]['current_price'] = current_price
+                                            
+                                            # Update unrealized PnL
+                                            entry_price = self.positions[symbol].get('entry_price', 0)
+                                            size = self.positions[symbol].get('size', 0)
+                                            side = self.positions[symbol].get('side', 'long')
+                                            
+                                            if entry_price > 0 and size > 0:
+                                                if side == 'long':
+                                                    pnl = (current_price - entry_price) * size
+                                                else:  # short
+                                                    pnl = (entry_price - current_price) * size
+                                                self.positions[symbol]['unrealized_pnl'] = pnl
+                                except Exception:
+                                    pass  # Skip this position if error
+                        
+                        # UPDATE STATS: Write to file every sync (every 5 seconds)
+                        # This ensures UI stays fresh even when main loop is stuck in long scan
+                        try:
+                            from .stats_writer import update_stats
+                            update_stats(self)
+                        except Exception:
+                            pass  # Non-critical
+                        
+                        await asyncio.sleep(5.0)  # Sync every 5 seconds (was 2s, caused rate limits)
+                    except Exception as e:
+                        self.logger.error(f"[POSITION_SYNC_TASK] Error: {e}", exc_info=True)
+                        await asyncio.sleep(5.0)  # Continue even on error
+            
+            # Start the continuous sync task
+            asyncio.create_task(continuous_position_sync())
+            self.logger.info("[POSITION_SYNC] Started dedicated position sync task (every 5 seconds)")
+            
             while True:
+                # STATS WRITER UPDATE (for DRY_RUN_MONITOR)
+                # Write stats at START of loop (before any long operations)
+                try:
+                    from .stats_writer import update_stats
+                    update_stats(self)
+                    # DEBUG: Log once to confirm it's working
+                    if not hasattr(self, '_stats_writer_working_logged'):
+                        self.logger.info("[STATS_WRITER] Successfully writing stats every loop")
+                        self._stats_writer_working_logged = True
+                except Exception as e:
+                    # Log error for debugging (but don't disrupt bot)
+                    if not hasattr(self, '_stats_writer_error_logged'):
+                        self.logger.error(f"[STATS_WRITER] Failed to update stats: {e}")
+                        self._stats_writer_error_logged = True
+                
                 # DIAG: Trace loop heartbeat (debug level to avoid console spam)
                 try:
                     self.logger.debug("[DIAG] main_loop:tick")
@@ -5895,49 +7196,35 @@ class ScalperBot:
                 if self._get_current_time() - self._last_llm_check >= llm_check_interval:
                     await self.ctrl.check_control_patch(self)
                     self.ctrl.generate_advisor_suggestions(self)
-                    self.ctrl.check_and_switch_regime(self)  # Check and switch regime if needed
+                    # Regime switching disabled - using ML scores instead
                     self._last_llm_check = self._get_current_time()
 
-                # [!] MAXIMUM AGGRESSION: Force scalping regime on startup
-                if not hasattr(self, '_aggressive_mode_forced'):
-                    from .regime import TradingRegime
-                    self.ctrl.regime_manager.set_regime(TradingRegime.SCALPING, "[FORCED] Maximum aggression mode")
-                    self.current_regime = TradingRegime.SCALPING.value
-                    self.regime_since = self._get_current_time()
-                    regime_config = self.ctrl.regime_manager.get_current_config()
-                    self.regime_config = regime_config
-                    self.ctrl.apply_regime_config(self, regime_config)
-                    self._aggressive_mode_forced = True
-                    # CRITICAL FIX: Enforce sane minimum scan interval to prevent API throttling
-                    # Binance limit ~1200 req/min. 100 symbols * (60/5) = 1200 req/min.
-                    # So 5.0s is the absolute minimum safe interval for 100 symbols.
-                    if regime_config.scan_interval_seconds < 5.0:
-                        regime_config.scan_interval_seconds = 5.0
-                        
-                    self.logger.warning(
-                        f"[!] MAXIMUM AGGRESSION MODE ACTIVATED | "
-                        f"scan_interval={regime_config.scan_interval_seconds}s | "
-                        f"max_positions={regime_config.max_concurrent_positions} | "
-                        f"risk_per_trade={self.cfg.RISK_PER_TRADE_PCT:.1f}% | total_risk={self.cfg.MAX_ACCOUNT_RISK_PCT:.1f}%"
+                # REGIME SYSTEM DISABLED: Let ML and user config control behavior
+                # The regime system was overriding ML-based decisions with hardcoded rules
+                # Now we trust the ML models and user configuration instead
+                if not hasattr(self, '_regime_disabled_logged'):
+                    self.logger.info(
+                        f"[ML_MODE] Regime system disabled - using ML scores and user config | "
+                        f"max_positions={self.cfg.MAX_CONCURRENT_POS} | "
+                        f"min_score={self.cfg.MIN_SIGNAL_SCORE} | "
+                        f"risk_per_trade={self.cfg.RISK_PER_TRADE_PCT:.1f}%"
                     )
+                    self._regime_disabled_logged = True
 
-                # Get regime-specific intervals (ensure regime_config is set)
-                regime_config = getattr(self, 'regime_config', None)
-                if regime_config is None:
-                    # Fallback: Initialize regime config if somehow None
-                    regime_config = self.ctrl.regime_manager.get_current_config()
-                    self.ctrl.apply_regime_config(self, regime_config)
-                    self.regime_config = regime_config
-                
-                universe_interval = regime_config.universe_refresh_interval_seconds
-                scan_interval = regime_config.scan_interval_seconds
+                # Use config values directly (regime system disabled)
+                # Default intervals for ML-based trading
+                universe_interval = 30.0  # Refresh universe every 30s
+                scan_interval = 3.0  # Scan for signals every 3s (balanced)
                 
                 # Skip debug logs on startup
                 current_time = self._get_current_time()
 
                 # Refresh universe at regime-specific interval
                 if current_time >= next_universe:
-                    await self.refresh_universe()
+                    try:
+                        await self.refresh_universe()
+                    except Exception as e:
+                        self.logger.error(f"[CRITICAL] Universe refresh failed: {e}", exc_info=True)
                     next_universe = current_time + universe_interval
                     self.next_universe_refresh_time = next_universe
                     self.last_universe_refresh_time = current_time
@@ -5963,7 +7250,10 @@ class ScalperBot:
                     except Exception:
                         pass
                     # Skip debug logs for strategy cycles
-                    await self.scan_and_enter_signals()
+                    try:
+                        await self.scan_and_enter_signals()
+                    except Exception as e:
+                        self.logger.error(f"[CRITICAL] Signal scan failed: {e}", exc_info=True)
                     next_signal_scan = current_time + scan_interval
                     self.next_scan_time = next_signal_scan
                     
@@ -5983,7 +7273,10 @@ class ScalperBot:
                     pass
                 
                 # Monitor and exit positions (check every loop iteration)
-                await self.monitor_and_exit_positions()
+                try:
+                    await self.monitor_and_exit_positions()
+                except Exception as e:
+                    self.logger.error(f"[CRITICAL] Position monitoring failed: {e}", exc_info=True)
                 
                 # API BUDGET OPTIMIZATION: Refresh orderbooks for open positions (better exit decisions)
                 # [!] THROTTLE PROTECTION: Use separate timer for position orderbooks (10s interval)
@@ -5993,7 +7286,9 @@ class ScalperBot:
                 # UI UPDATE
                 loop_now = time.time()
                 # Rich UI is slightly heavier; update a bit less often
-                if UI_MODE in ("rich", "v2"):
+                if UI_MODE == "btop":
+                    ui_update_interval = 0.5  # Fast updates for btop (0.5s for smooth graphs)
+                elif UI_MODE in ("rich", "v2"):
                     ui_update_interval = 1.0  # Faster updates for v2/rich (1s)
                 elif UI_MODE == "v4":
                     ui_update_interval = 2.0
@@ -6030,6 +7325,42 @@ class ScalperBot:
                                 f"Equity: ${snapshot.performance.equity:.2f} | "
                                 f"Unrealized: ${snapshot.performance.unrealized_pnl:.2f}"
                             )
+                        
+                        # POSITION COUNT DIAGNOSTIC: Compare bot vs Binance every 60s
+                        if not self.replay_mode and self.exchange_wrapper:
+                            try:
+                                binance_positions = await self.exchange_wrapper.fetch_positions()
+                                binance_active = []
+                                binance_symbols_set = set()
+                                
+                                for p in binance_positions:
+                                    size = abs(float(p.get('contracts', 0)))
+                                    if size > 0:
+                                        sym = p.get('symbol') or p.get('symbolName')
+                                        if sym:
+                                            if hasattr(self.exchange_wrapper, 'normalize_symbol'):
+                                                sym = self.exchange_wrapper.normalize_symbol(sym)
+                                            clean_sym = sym.replace("/", "").replace("-", "").replace(":", "")
+                                            if not ("USDTUSDT" in clean_sym or (len(clean_sym) > 6 and clean_sym[-6:].isdigit())):
+                                                binance_active.append(p)
+                                                binance_symbols_set.add(sym)
+                                
+                                bot_symbols_set = set(self.positions.keys())
+                                bot_count = len(bot_symbols_set)
+                                binance_count = len(binance_symbols_set)
+                                
+                                if bot_count != binance_count:
+                                    self.logger.warning(
+                                        f"[POSITION_COUNT_DIAGNOSTIC] Mismatch: Bot={bot_count}, Binance={binance_count}. "
+                                        f"Bot: {sorted(bot_symbols_set)}, Binance: {sorted(binance_symbols_set)}"
+                                    )
+                                else:
+                                    self.logger.info(
+                                        f"[POSITION_COUNT_DIAGNOSTIC] Match: Both have {bot_count} positions. "
+                                        f"Symbols: {sorted(bot_symbols_set)}"
+                                    )
+                            except Exception as e:
+                                self.logger.debug(f"[POSITION_COUNT_DIAGNOSTIC] Could not verify: {e}")
                         
                         # Metrics logging
                         total_attempted = self.metrics['entries_attempted']

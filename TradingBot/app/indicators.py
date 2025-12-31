@@ -291,3 +291,218 @@ def calculate_momentum_from_rsi(rsi: Optional[float], side: str) -> float:
             # Oversold: taper down more aggressively
             return max(0.0, 0.8 - ((25 - rsi) / 25.0) * 0.8)
 
+
+# ============================================================================
+# NEW INDICATORS FOR BETTER PERFORMANCE
+# ============================================================================
+
+def calculate_macd(prices: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> Optional[Dict[str, float]]:
+    """
+    Calculate MACD (Moving Average Convergence Divergence).
+    
+    Args:
+        prices: List of closing prices (most recent last)
+        fast: Fast EMA period (default 12)
+        slow: Slow EMA period (default 26)
+        signal: Signal line EMA period (default 9)
+    
+    Returns:
+        Dict with 'macd', 'signal', 'histogram' or None if insufficient data
+    """
+    if len(prices) < slow + signal:
+        return None
+    
+    try:
+        ema_fast = calculate_ema(prices, fast)
+        ema_slow = calculate_ema(prices, slow)
+        
+        if ema_fast is None or ema_slow is None:
+            return None
+        
+        macd_line = ema_fast - ema_slow
+        
+        # Calculate signal line (EMA of MACD)
+        macd_values = [ema_fast - ema_slow for ema_fast, ema_slow in zip(
+            [calculate_ema(prices[:i], fast) for i in range(slow, len(prices) + 1)],
+            [calculate_ema(prices[:i], slow) for i in range(slow, len(prices) + 1)]
+        )]
+        
+        if len(macd_values) < signal:
+            return None
+        
+        signal_line = calculate_ema(macd_values, signal)
+        histogram = macd_line - signal_line if signal_line else 0
+        
+        return {
+            'macd': macd_line,
+            'signal': signal_line,
+            'histogram': histogram,
+        }
+    except (ValueError, IndexError, TypeError):
+        return None
+
+
+def calculate_stochastic_rsi(prices: List[float], rsi_period: int = 14, k_period: int = 3, d_period: int = 3) -> Optional[Dict[str, float]]:
+    """
+    Calculate Stochastic RSI (RSI of RSI) for overbought/oversold extremes.
+    
+    Args:
+        prices: List of closing prices (most recent last)
+        rsi_period: RSI period (default 14)
+        k_period: K smoothing period (default 3)
+        d_period: D smoothing period (default 3)
+    
+    Returns:
+        Dict with '%K', '%D', or None if insufficient data
+    """
+    if len(prices) < rsi_period + k_period + d_period:
+        return None
+    
+    try:
+        # Calculate RSI values for the last (rsi_period + k_period + d_period) candles
+        rsi_values = []
+        for i in range(len(prices) - rsi_period - k_period - d_period + 1, len(prices) + 1):
+            rsi = calculate_rsi(prices[:i], rsi_period)
+            if rsi is not None:
+                rsi_values.append(rsi)
+        
+        if len(rsi_values) < k_period + d_period:
+            return None
+        
+        # Calculate Stochastic: (RSI - min RSI) / (max RSI - min RSI)
+        min_rsi = min(rsi_values[-k_period:]) if len(rsi_values) >= k_period else min(rsi_values)
+        max_rsi = max(rsi_values[-k_period:]) if len(rsi_values) >= k_period else max(rsi_values)
+        
+        if max_rsi == min_rsi:
+            stoch_rsi = 50.0
+        else:
+            stoch_rsi = ((rsi_values[-1] - min_rsi) / (max_rsi - min_rsi)) * 100.0
+        
+        # Calculate K and D lines
+        k_line = stoch_rsi  # Simplified: just current stoch RSI
+        d_line = calculate_ema([stoch_rsi], d_period) if len(rsi_values) >= d_period else stoch_rsi
+        
+        return {
+            'K': k_line,
+            'D': d_line,
+        }
+    except (ValueError, IndexError, TypeError, ZeroDivisionError):
+        return None
+
+
+def calculate_bollinger_bands(prices: List[float], period: int = 20, num_std: float = 2.0) -> Optional[Dict[str, float]]:
+    """
+    Calculate Bollinger Bands for dynamic support/resistance.
+    
+    Args:
+        prices: List of closing prices (most recent last)
+        period: Moving average period (default 20)
+        num_std: Number of standard deviations (default 2.0)
+    
+    Returns:
+        Dict with 'upper', 'middle', 'lower', 'width' or None
+    """
+    if len(prices) < period:
+        return None
+    
+    try:
+        recent_prices = prices[-period:]
+        middle = sum(recent_prices) / period
+        
+        # Calculate standard deviation
+        variance = sum((p - middle) ** 2 for p in recent_prices) / period
+        std_dev = variance ** 0.5
+        
+        upper = middle + (num_std * std_dev)
+        lower = middle - (num_std * std_dev)
+        width = upper - lower
+        
+        return {
+            'upper': upper,
+            'middle': middle,
+            'lower': lower,
+            'width': width,
+            'width_pct': (width / middle * 100) if middle > 0 else 0,
+        }
+    except (ValueError, IndexError, ZeroDivisionError):
+        return None
+
+
+def calculate_volume_confirmation(volume: List[float], prices: List[float], period: int = 20) -> Optional[float]:
+    """
+    Calculate volume confirmation strength (0-1).
+    Price move with volume > average volume = strong
+    
+    Args:
+        volume: List of volumes (most recent last)
+        prices: List of prices (most recent last)
+        period: Period for average volume (default 20)
+    
+    Returns:
+        Confirmation score 0-1, or None if insufficient data
+    """
+    if len(volume) < period or len(prices) < 2:
+        return None
+    
+    try:
+        avg_volume = sum(volume[-period:]) / period
+        current_volume = volume[-1]
+        current_move = abs(prices[-1] - prices[-2]) / prices[-2] if prices[-2] > 0 else 0
+        
+        # Strong confirmation: volume > 1.5x average AND price moved
+        volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1.0
+        
+        if volume_ratio > 1.5 and current_move > 0.002:  # 0.2% move
+            return min(1.0, (volume_ratio - 1.0) * 0.5 + (current_move * 100))  # Normalized
+        elif volume_ratio > 1.2:
+            return 0.6
+        else:
+            return 0.3  # Below average volume = weak
+    except (ValueError, IndexError, ZeroDivisionError):
+        return None
+
+
+def detect_rsi_divergence(prices: List[float], highs: List[float], lows: List[float], lookback: int = 10) -> Optional[str]:
+    """
+    Detect RSI divergence (price makes new high/low but RSI doesn't).
+    Early exit signal for reversals.
+    
+    Args:
+        prices: Closing prices
+        highs: High prices
+        lows: Low prices
+        lookback: Lookback period to check (default 10)
+    
+    Returns:
+        'bullish_div' (RSI higher, price lower - uptrend), 
+        'bearish_div' (RSI lower, price higher - downtrend),
+        or None if no divergence
+    """
+    if len(prices) < lookback + 5 or len(highs) < lookback + 5 or len(lows) < lookback + 5:
+        return None
+    
+    try:
+        # Get current and previous RSI
+        current_rsi = calculate_rsi(prices, 14)
+        prev_rsi = calculate_rsi(prices[:-1], 14) if len(prices) > 15 else None
+        
+        if current_rsi is None or prev_rsi is None:
+            return None
+        
+        # Compare highs/lows
+        recent_high = max(highs[-lookback:])
+        recent_low = min(lows[-lookback:])
+        prev_high = max(highs[-lookback-5:-5]) if len(highs) > lookback + 5 else recent_high
+        prev_low = min(lows[-lookback-5:-5]) if len(lows) > lookback + 5 else recent_low
+        
+        # Bearish divergence: price makes new high, but RSI makes lower high
+        if recent_high > prev_high and current_rsi < prev_rsi and current_rsi > 70:
+            return 'bearish_div'
+        
+        # Bullish divergence: price makes new low, but RSI makes higher low
+        if recent_low < prev_low and current_rsi > prev_rsi and current_rsi < 30:
+            return 'bullish_div'
+        
+        return None
+    except (ValueError, IndexError, TypeError):
+        return None

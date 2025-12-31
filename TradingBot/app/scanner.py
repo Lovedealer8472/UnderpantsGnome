@@ -373,8 +373,20 @@ class SymbolScanner:
                     price_data = None
                     indicators = None
             else:
-                # LIVE MODE: Get indicators from cache
-                if hasattr(self.bot, 'indicators_cache'):
+                # LIVE MODE: Get indicators from live calculator or cache
+                indicators = None
+                if hasattr(self.bot, 'live_indicator_calculator') and self.bot.live_indicator_calculator:
+                    # Try to get from live calculator (may fetch if needed)
+                    try:
+                        indicators = await self.bot.live_indicator_calculator.get_indicators(symbol)
+                        # Store in cache for other code that reads it
+                        if indicators:
+                            self.bot.indicators_cache[symbol] = indicators
+                    except Exception as e:
+                        self.logger.debug(f"Failed to get live indicators for {symbol}: {e}")
+                
+                # Fallback to cache if live calculator failed
+                if not indicators and hasattr(self.bot, 'indicators_cache'):
                     indicators = self.bot.indicators_cache.get(symbol)
             
             # CRITICAL FIX: Final validation check before signal generation

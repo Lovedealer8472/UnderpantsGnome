@@ -8,7 +8,7 @@ from typing import Optional, Dict, Tuple, Any
 from dataclasses import dataclass
 
 from .config import (
-    TAKER_FEE_RATE, SLIPPAGE_BPS, DRY_RUN, DRY_SIMPLE_EXITS,
+    TAKER_FEE_RATE, SLIPPAGE_BPS,
     TRAILING_STOP_ACTIVATION_PCT, TRAILING_STOP_PCT,
     WIDE_SPREAD_EXIT_THRESHOLD_BPS,
     USE_ATR_TRAILING_STOP, ATR_TRAILING_MULTIPLIER, ATR_TRAILING_MIN_DISTANCE_PCT,
@@ -71,6 +71,13 @@ class ExitManager:
                 self.trailing_engine = None
         else:
             self.trailing_engine = None
+        
+        # Initialize ML Monitor Feed for real-time learning
+        try:
+            from .ml_monitor_integration import get_ml_monitor_feed
+            self.ml_monitor_feed = get_ml_monitor_feed(enabled=True)
+        except Exception:
+            self.ml_monitor_feed = None
         
         # PERFORMANCE: Pre-bind frequently used config constants
         self._scalp_tp_r = R_SCALP_TP_R
@@ -381,35 +388,26 @@ class ExitManager:
                     f"but exit decision will be made by PRS system"
                 )
         
-        # Get regime-specific parameters
+        # Get regime-specific parameters for wide spread check
         if regime_config:
-            trailing_activation = regime_config.trailing_stop_activation_pct
-            trailing_pct = regime_config.trailing_stop_pct
             wide_spread_threshold = regime_config.wide_spread_exit_threshold_bps
         else:
-            trailing_activation = TRAILING_STOP_ACTIVATION_PCT
-            trailing_pct = TRAILING_STOP_PCT
             wide_spread_threshold = WIDE_SPREAD_EXIT_THRESHOLD_BPS
         
-        # Update trailing stop if profit exceeds activation threshold
-        updated_stop_loss = stop_loss
-        if profit_pct > trailing_activation:
-            should_trail, new_stop = self.should_use_trailing_stop(
-                position, current_price, profit_pct, regime_config
-            )
-            if should_trail:
-                updated_stop_loss = new_stop
-                # Update position's stop_loss for next check
-                position['stop_loss'] = new_stop
+        # NOTE: Trailing stop updates are now handled by SimpleStopLossManager in bot.py
+        # This function ONLY checks if SL is hit, it does NOT update trailing stops
         
-        # Check stop-loss (priority - exit immediately on stop-loss)
-        if updated_stop_loss > 0:
+        # Check stop-loss (priority - exit IMMEDIATELY on stop-loss)
+        # NO GRACE PERIODS: Exit at SL immediately
+        if stop_loss > 0:
             if side == 'long':
-                if current_price <= updated_stop_loss:
-                    return True, "stop_loss", updated_stop_loss
+                if current_price <= stop_loss:
+                    self.logger.info(f"[SL_HIT] {symbol} LONG: Price ${current_price:.8f} <= SL ${stop_loss:.8f} | Exiting immediately")
+                    return True, "stop_loss", stop_loss
             else:  # short
-                if current_price >= updated_stop_loss:
-                    return True, "stop_loss", updated_stop_loss
+                if current_price >= stop_loss:
+                    self.logger.info(f"[SL_HIT] {symbol} SHORT: Price ${current_price:.8f} >= SL ${stop_loss:.8f} | Exiting immediately")
+                    return True, "stop_loss", stop_loss
         
         # Check take-profit (exit when target reached)
         if take_profit > 0:
@@ -710,62 +708,54 @@ class ExitManager:
         
         # Execute exit order
         try:
-            if DRY_RUN:
-                # Simulate exit
-                exit_result = ExitResult(
-                    success=True,
-                    exit_price=target_price,
-                    exit_size=position_size,
-                    reason=reason
-                )
-            else:
-                # CANCEL BINANCE TRAILING STOP (if any)
-                # When the bot closes a position, we need to cancel any trailing stop
-                # to avoid a double-close attempt by Binance
-                try:
-                    if hasattr(self.exchange, 'cancel_trailing_stop'):
-                        await self.exchange.cancel_trailing_stop(symbol)
-                except Exception:
-                    pass  # Non-critical - continue with exit
+            # Always live - execute on real exchange
+            # CANCEL BINANCE TRAILING STOP (if any)
+            # When the bot closes a position, we need to cancel any trailing stop
+            # to avoid a double-close attempt by Binance
+            try:
+                if hasattr(self.exchange, 'cancel_trailing_stop'):
+                    await self.exchange.cancel_trailing_stop(symbol)
+            except Exception:
+                pass  # Non-critical - continue with exit
+            
+            # Real exit order
+            # CRITICAL: Format quantity to exchange precision before placing order
+            # This prevents precision errors like "872.7468749999999" which Binance rejects
+            # The exchange wrapper (binance_futures.create_order) handles precision, but we ensure it here too
+            try:
+                # Get the inner exchange if we have a wrapper (for precision methods)
+                inner_exchange = None
+                if hasattr(self.exchange, '_inner'):
+                    inner_exchange = self.exchange._inner
+                elif hasattr(self.exchange, 'exchange'):
+                    inner_exchange = getattr(self.exchange, 'exchange', None)
                 
-                # Real exit order
-                # CRITICAL: Format quantity to exchange precision before placing order
-                # This prevents precision errors like "872.7468749999999" which Binance rejects
-                # The exchange wrapper (binance_futures.create_order) handles precision, but we ensure it here too
-                try:
-                    # Get the inner exchange if we have a wrapper (for precision methods)
-                    inner_exchange = None
-                    if hasattr(self.exchange, '_inner'):
-                        inner_exchange = self.exchange._inner
-                    elif hasattr(self.exchange, 'exchange'):
-                        inner_exchange = getattr(self.exchange, 'exchange', None)
-                    
-                    # Format quantity using exchange's precision settings
-                    if inner_exchange and hasattr(inner_exchange, 'amount_to_precision'):
-                        formatted_quantity = inner_exchange.amount_to_precision(symbol, abs(position_size))
-                        final_quantity = float(formatted_quantity)
-                    else:
-                        # Fallback: round to reasonable precision (8 decimals)
-                        final_quantity = round(abs(position_size), 8)
-                    
-                    # Ensure quantity is not zero after formatting
-                    if final_quantity <= 0:
-                        return ExitResult(
-                            success=False,
-                            error=f"Exit quantity {position_size} formatted to zero (too small)"
-                        )
-                except Exception as e:
-                    # If formatting fails, use absolute value and round
+                # Format quantity using exchange's precision settings
+                if inner_exchange and hasattr(inner_exchange, 'amount_to_precision'):
+                    formatted_quantity = inner_exchange.amount_to_precision(symbol, abs(position_size))
+                    final_quantity = float(formatted_quantity)
+                else:
+                    # Fallback: round to reasonable precision (8 decimals)
                     final_quantity = round(abs(position_size), 8)
-                    if final_quantity <= 0:
-                        return ExitResult(
-                            success=False,
-                            error=f"Could not format exit quantity: {e}"
-                        )
                 
-                # OPTIMIZATION: Binance Futures USDT-M doesn't use positionSide
-                # Use reduceOnly=True for exits (Binance-specific safety parameter)
-                # This ensures the order only reduces position, never increases it
+                # Ensure quantity is not zero after formatting
+                if final_quantity <= 0:
+                    return ExitResult(
+                        success=False,
+                        error=f"Exit quantity {position_size} formatted to zero (too small)"
+                    )
+            except Exception as e:
+                # If formatting fails, use absolute value and round
+                final_quantity = round(abs(position_size), 8)
+                if final_quantity <= 0:
+                    return ExitResult(
+                        success=False,
+                        error=f"Could not format exit quantity: {e}"
+                    )
+            
+            # OPTIMIZATION: Binance Futures USDT-M doesn't use positionSide
+            # Use reduceOnly=True for exits (Binance-specific safety parameter)
+            # This ensures the order only reduces position, never increases it
                 exit_params = {"reduceOnly": True}  # Binance Futures safety parameter
                 
                 if use_limit:
@@ -842,6 +832,30 @@ class ExitManager:
             exit_result.slippage = costs['slippage']
             exit_result.funding_cost = funding_cost
             
+            # Feed trade outcome to ML Monitor for real-time learning
+            if self.ml_monitor_feed:
+                try:
+                    entry_price = position.get('entry_price', 0)
+                    pnl_pct = (net_pnl / (entry_price * exit_result.exit_size)) if entry_price > 0 and exit_result.exit_size > 0 else 0
+                    
+                    self.ml_monitor_feed.feed_trade_outcome({
+                        'symbol': symbol,
+                        'side': position.get('side', 'long'),
+                        'entry_time': position.get('entry_time', 0),
+                        'exit_time': time.time(),
+                        'entry_price': entry_price,
+                        'exit_price': exit_result.exit_price,
+                        'pnl': net_pnl,
+                        'pnl_pct': pnl_pct,
+                        'exit_reason': reason,
+                        'signal_score': position.get('signal_score', 0),
+                        'ml_confidence': position.get('ml_confidence', 0),
+                        'regime': position.get('regime', 'unknown')
+                    })
+                except Exception as e:
+                    # Non-critical - don't fail exit if feed fails
+                    pass
+            
             return exit_result
             
         except Exception as e:
@@ -909,6 +923,23 @@ class ExitManager:
         regime_config: Optional[Any] = None
     ) -> Tuple[bool, float]:
         """
+        Check if trailing stop should be used for this position.
+        
+        ADOPTED POSITIONS: Use trailing stops only after position is in meaningful profit.
+        This prevents immediate exits on small price movements while still protecting
+        real gains. Initial stop-loss protects downside until then.
+        """
+        # ADOPTED POSITIONS: Enable trailing only after +1.5% profit
+        # This gives the position room to breathe while still protecting real gains
+        if position.get('force_adopted') or position.get('emergency_adopted'):
+            MIN_PROFIT_FOR_TRAILING = 1.5  # 1.5% profit before trailing activates
+            
+            if profit_pct < MIN_PROFIT_FOR_TRAILING:
+                # Not enough profit yet - use initial stop-loss only
+                # This protects downside while giving position room to develop
+                return False, position.get('stop_loss', 0)
+            # Position is in profit - now use trailing to protect gains
+        """
         Determine if trailing stop should be activated.
         Uses ATR-based trailing if enabled and ATR available, otherwise falls back to percentage-based.
         
@@ -934,39 +965,76 @@ class ExitManager:
         if profit_pct < trailing_activation:
             return False, stop_loss
         
-        # Try ATR-based trailing stop first (if enabled and ATR available)
+        # TIERED TRAILING: Tighten trail as profit grows
+        # This protects big wins while giving small profits room to breathe
+        if profit_pct >= 20.0:
+            trailing_pct = 0.95  # Lock 95% of profit (20%+ profit - unicorn protection)
+        elif profit_pct >= 10.0:
+            trailing_pct = 0.90  # Lock 90% of profit (10-20% profit - big win protection)
+        elif profit_pct >= 5.0:
+            trailing_pct = 0.80  # Lock 80% of profit (5-10% profit - solid win)
+        elif profit_pct >= 2.0:
+            trailing_pct = 0.70  # Lock 70% of profit (2-5% profit - emerging profit)
+        # else: use default trailing_pct (50-60% for small profits 0.5-2%)
+        
+        # Calculate both ATR-based and percentage-based trailing stops
+        # Use whichever is TIGHTER (better protection)
+        atr_stop = None
+        pct_stop = None
+        
+        # Try ATR-based trailing stop (if enabled and ATR available)
         if USE_ATR_TRAILING_STOP:
             atr_stop = self.calculate_atr_trailing_stop(position, current_price, regime_config)
             if atr_stop is not None:
                 # Update peak/trough in position for next check
                 if side == 'long':
                     position['peak_price'] = max(position.get('peak_price', entry_price), current_price)
-                    # Use the better (higher) stop for long
-                    if atr_stop > stop_loss:
-                        return True, atr_stop
                 else:  # short
                     position['trough_price'] = min(position.get('trough_price', entry_price), current_price)
-                    # Use the better (lower) stop for short
-                    if atr_stop < stop_loss:
-                        return True, atr_stop
         
-        # Fallback to percentage-based trailing stop
+        # Calculate percentage-based trailing stop
         if side == 'long':
             # Trail stop up to configured percentage of profit
             profit_amount = current_price - entry_price
             trail_amount = profit_amount * trailing_pct
-            new_stop = entry_price + trail_amount
-            # Don't move stop down
-            if new_stop > stop_loss:
-                return True, new_stop
+            pct_stop = entry_price + trail_amount
         else:  # short
             # Trail stop down to configured percentage of profit
             profit_amount = entry_price - current_price
             trail_amount = profit_amount * trailing_pct
-            new_stop = entry_price - trail_amount
-            # Don't move stop up
-            if new_stop < stop_loss:
-                return True, new_stop
+            pct_stop = entry_price - trail_amount
+        
+        # HYBRID STRATEGY: Use the TIGHTER of ATR or percentage trailing
+        # This gives best protection by combining volatility-aware (ATR) and profit-aware (tiered %) logic
+        best_stop = stop_loss
+        stop_source = "none"
+        
+        if side == 'long':
+            # For longs, tighter = higher stop
+            if atr_stop is not None and atr_stop > best_stop:
+                best_stop = atr_stop
+                stop_source = "atr"
+            if pct_stop is not None and pct_stop > best_stop:
+                best_stop = pct_stop
+                stop_source = f"tiered_{int(trailing_pct*100)}pct"
+        else:  # short
+            # For shorts, tighter = lower stop
+            if atr_stop is not None and atr_stop < best_stop:
+                best_stop = atr_stop
+                stop_source = "atr"
+            if pct_stop is not None and pct_stop < best_stop:
+                best_stop = pct_stop
+                stop_source = f"tiered_{int(trailing_pct*100)}pct"
+        
+        # Only activate if we found a better stop
+        if best_stop != stop_loss:
+            # Log the trailing update with source
+            if stop_source != "none":
+                self.logger.debug(
+                    f"[TRAIL] {position.get('symbol', 'UNKNOWN')}: "
+                    f"profit={profit_pct:.1f}% | stop={best_stop:.6f} | source={stop_source}"
+                )
+            return True, best_stop
         
         return False, stop_loss
     
@@ -1286,20 +1354,6 @@ class ExitManager:
         """
         # Update R metadata
         self.update_position_r_metadata(position, current_price, bar_closed)
-        
-        # DRY_RUN simple exits: bypass trailing/partial logic
-        if DRY_RUN and DRY_SIMPLE_EXITS:
-            # In DRY simple mode, exits are handled by evaluate_scalper_trailing
-            # Just check hard SL here as fallback
-            stop_loss = position.get('stop_loss')
-            if stop_loss:
-                side = position.get('side', '').lower()
-                if side == 'long' and current_price <= stop_loss:
-                    return True, "stop_loss_hit", current_price, 1.0
-                elif side == 'short' and current_price >= stop_loss:
-                    return True, "stop_loss_hit", current_price, 1.0
-            # Otherwise let scalper_exits handle simple DRY exits
-            return False, None, None, None
         
         # NEW: Check new trailing stop engine first (gets priority)
         if USE_NEW_TRAILING_ENGINE and self.trailing_engine:

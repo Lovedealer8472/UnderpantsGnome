@@ -145,6 +145,23 @@ class ExchangeBase(ABC):
         pass
     
     @abstractmethod
+    async def fetch_orders(self, symbol: Optional[str] = None, since: Optional[int] = None, 
+                          limit: Optional[int] = None, params: Optional[Dict] = None) -> List[Dict[str, Any]]:
+        """
+        Fetch orders for a symbol.
+        
+        Args:
+            symbol: Trading symbol (optional, fetch all if None)
+            since: Timestamp in ms to fetch orders from
+            limit: Number of orders to fetch
+            params: Additional parameters
+            
+        Returns:
+            List of order dictionaries
+        """
+        pass
+    
+    @abstractmethod
     async def fetch_order(self, order_id: str, symbol: str, params: Optional[Dict] = None) -> Optional[Dict[str, Any]]:
         """
         Fetch order status by order ID.

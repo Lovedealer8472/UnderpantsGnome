@@ -26,13 +26,13 @@ from ..models import Position, Trade
 
 # Import config constants needed for exit logic
 from ..config import (
-    TAKER_FEE_RATE, SLIPPAGE_BPS, DRY_RUN, DRY_SIMPLE_EXITS,
+    TAKER_FEE_RATE, SLIPPAGE_BPS,
     TRAILING_STOP_ACTIVATION_PCT, TRAILING_STOP_PCT,
     WIDE_SPREAD_EXIT_THRESHOLD_BPS,
     USE_ATR_TRAILING_STOP, ATR_TRAILING_MULTIPLIER, ATR_TRAILING_MIN_DISTANCE_PCT,
     ATR_TRAILING_SCALPING_MULTIPLIER, ATR_TRAILING_DAY_MULTIPLIER, ATR_TRAILING_SWING_MULTIPLIER,
     MAX_POSITION_AGE_SEC, STALE_POSITION_PNL_THRESHOLD,
-    BERP_ENABLED, BERP_TRIGGER_AGE_SEC, BERP_TRIGGER_PNL_THRESHOLD, BERP_RESCUE_DURATION_SEC,
+    BERP_ENABLED, BERP_TRIGGER_AGE_SEC, BERP_TRIGGER_PNL_THRESHOLD, BERP_RESCUE_DURATION_SEC, BERP_PROFIT_OVERRIDE_PCT,
     STALE_90MIN_AGE_SEC, STALE_90MIN_PNL_THRESHOLD, EXTENDED_LEASH_PNL_THRESHOLD,
     EXTENDED_LEASH_AGE_SEC, STALE_DRAWDOWN_RESUME_THRESHOLD,
     USE_R_BASED_EXITS, R_EXIT_SCALP_SCORE_MIN, R_EXIT_SCALP_SCORE_MAX,
@@ -775,6 +775,57 @@ class ExitPipeline:
             # New trailing engine is handled elsewhere, skip here
             return None
         
+        # EARLY PROTECTION: No trailing stops during first 15 minutes
+        # This prevents premature exits from micro-volatility
+        # SKIP for adopted positions (they may already be old)
+        is_adopted = position.get('is_adopted', False)
+        entry_time = position.get('entry_time', 0)
+        if entry_time > 0 and not is_adopted:
+            from ..config import EARLY_PROTECTION_MIN, EARLY_PROTECTION_ALLOW_EMERGENCY
+            age_minutes = (now - entry_time) / 60.0
+            
+            if age_minutes < EARLY_PROTECTION_MIN:
+                # Check for emergency exit (catastrophic loss)
+                if EARLY_PROTECTION_ALLOW_EMERGENCY:
+                    entry_price = position.get('entry_price', 0)
+                    if entry_price > 0:
+                        if side == 'long':
+                            loss_pct = ((current_price - entry_price) / entry_price) * 100
+                        else:
+                            loss_pct = ((entry_price - current_price) / entry_price) * 100
+                        
+                        # Emergency exit if loss > 5%
+                        if loss_pct < -5.0:
+                            action = TrailingAction()
+                            action.partial_actions.append((1.0, "emergency_exit_catastrophic_loss"))
+                            self.logger.warning(
+                                f"[EMERGENCY] {symbol} CATASTROPHIC LOSS | "
+                                f"age={age_minutes:.1f}min loss={loss_pct:.2f}% - Emergency exit"
+                            )
+                            return action
+                
+                # Still in protection period - no trailing
+                self.logger.debug(
+                    f"[EARLY_PROTECTION] {symbol} age={age_minutes:.1f}min < {EARLY_PROTECTION_MIN}min - "
+                    f"Blocking trailing stops"
+                )
+                return None
+        
+        # ADOPTED POSITIONS: Only use trailing if position is in profit
+        # This prevents immediate exits on adopted manual positions
+        if position.get('force_adopted') or position.get('emergency_adopted'):
+            # Calculate profit percentage
+            entry_price = position.get('entry_price', 0)
+            if entry_price > 0:
+                if side == 'long':
+                    profit_pct = ((current_price - entry_price) / entry_price) * 100
+                else:  # short
+                    profit_pct = ((entry_price - current_price) / entry_price) * 100
+                
+                # Only use trailing if in profit by at least 1.5%
+                if profit_pct < 1.5:
+                    return None  # Skip trailing, use initial stop-loss only
+        
         # Old trailing engine has evaluate() method
         action = self.trailing_engine.evaluate(symbol, position, current_price, now=now)
         
@@ -1039,39 +1090,52 @@ class ExitPipeline:
                 if profit_pct >= 0.0:
                     return True, "rescued_at_breakeven", current_price
                 
-                # ❌ Rescue timeout expired - exit as failed rescue
+                # 🎯 PROFIT OVERRIDE: If position in profit after 60min, extend hold with tight trailing
                 if time_in_rescue >= BERP_RESCUE_DURATION_SEC:
-                    return True, "failed_rescue_after_60m", current_price
+                    if profit_pct >= BERP_PROFIT_OVERRIDE_PCT:
+                        # Position is profitable - extend hold and tighten trailing stop
+                        logger.info(
+                            f"[BERP_PROFIT_EXTENSION] {symbol} LONG R={profit_pct:.2f}% "
+                            f"at 60min - extending hold with tight trailing (profit_override={BERP_PROFIT_OVERRIDE_PCT}%)"
+                        )
+                        # Don't exit - let trailing stop handle it
+                        # Tighten the stop loss to lock in profits
+                        if stop_loss > 0:
+                            if side == 'long':
+                                # Tighter trailing for profitable positions: move stop to lock in 50% of profit
+                                profit_range = current_price - entry_price
+                                tight_stop = entry_price + (profit_range * 0.5)  # Lock in at 50% of profit
+                                if tight_stop > stop_loss:
+                                    position['stop_loss'] = tight_stop
+                                    logger.info(f"[BERP_TIGHT_TRAILING] {symbol} tightened SL: {stop_loss:.6f} -> {tight_stop:.6f}")
+                            else:  # short
+                                profit_range = entry_price - current_price
+                                tight_stop = entry_price - (profit_range * 0.5)  # Lock in at 50% of profit
+                                if tight_stop < stop_loss:
+                                    position['stop_loss'] = tight_stop
+                                    logger.info(f"[BERP_TIGHT_TRAILING] {symbol} tightened SL: {stop_loss:.6f} -> {tight_stop:.6f}")
+                        return False, "berp_extended_hold_profitable", current_price
+                    else:
+                        # ❌ Rescue timeout expired - exit as failed rescue (not profitable enough)
+                        return True, "failed_rescue_after_60m", current_price
         
         # Get regime-specific parameters
         if regime_config:
-            trailing_activation = regime_config.trailing_stop_activation_pct
-            trailing_pct = regime_config.trailing_stop_pct
             wide_spread_threshold = regime_config.wide_spread_exit_threshold_bps
         else:
-            trailing_activation = TRAILING_STOP_ACTIVATION_PCT
-            trailing_pct = TRAILING_STOP_PCT
             wide_spread_threshold = WIDE_SPREAD_EXIT_THRESHOLD_BPS
         
-        # Update trailing stop if profit exceeds activation threshold
-        updated_stop_loss = stop_loss
-        if profit_pct > trailing_activation:
-            should_trail, new_stop = self.should_use_trailing_stop(
-                position, current_price, profit_pct, regime_config
-            )
-            if should_trail:
-                updated_stop_loss = new_stop
-                # Update position's stop_loss for next check
-                position['stop_loss'] = new_stop
+        # NOTE: Trailing stop updates are now handled by SimpleStopLossManager in bot.py
+        # This function ONLY checks if SL is hit, it does NOT update trailing stops
         
         # Check stop-loss (priority - exit immediately on stop-loss)
-        if updated_stop_loss > 0:
+        if stop_loss > 0:
             stop_hit = False
             if side == 'long':
-                if current_price <= updated_stop_loss:
+                if current_price <= stop_loss:
                     stop_hit = True
             else:  # short
-                if current_price >= updated_stop_loss:
+                if current_price >= stop_loss:
                     stop_hit = True
             
             if stop_hit:
@@ -1079,9 +1143,9 @@ class ExitPipeline:
                 if symbol and ('PIPPIN' in symbol.upper() or self.logger.isEnabledFor(logging.DEBUG)):
                     self.logger.warning(
                         f"[STOP_LOSS_HIT] {symbol} {side.upper()} | "
-                        f"price={current_price:.6f} stop={updated_stop_loss:.6f} entry={entry_price:.6f}"
+                        f"price={current_price:.6f} stop={stop_loss:.6f} entry={entry_price:.6f}"
                     )
-                return True, "stop_loss", updated_stop_loss
+                return True, "stop_loss", stop_loss
         
         # Check take-profit (exit when target reached)
         if take_profit > 0:
@@ -1164,19 +1228,7 @@ class ExitPipeline:
         # Update R metadata
         self.update_position_r_metadata(position, current_price, bar_closed)
         
-        # DRY_RUN simple exits: bypass trailing/partial logic
-        if DRY_RUN and DRY_SIMPLE_EXITS:
-            # In DRY simple mode, exits are handled by evaluate_scalper_trailing
-            # Just check hard SL here as fallback
-            stop_loss = position.get('stop_loss')
-            if stop_loss:
-                side = position.get('side', '').lower()
-                if side == 'long' and current_price <= stop_loss:
-                    return True, "stop_loss_hit", current_price, 1.0
-                elif side == 'short' and current_price >= stop_loss:
-                    return True, "stop_loss_hit", current_price, 1.0
-            # Otherwise let scalper_exits handle simple DRY exits
-            return False, None, None, None
+        # Always live - use full exit logic with trailing/partial
         
         # NEW: Check new trailing stop engine first (gets priority)
         if USE_NEW_TRAILING_ENGINE and self.trailing_engine:
@@ -1961,8 +2013,7 @@ class ExitPipeline:
             exchange = self.order_manager.exchange
         
         # Validate exchange is available for live trading
-        from ..config import DRY_RUN
-        if not DRY_RUN and not exchange:
+        if not exchange:
             return ExitResult(
                 success=False,
                 error="Exchange not initialized"
@@ -2041,93 +2092,84 @@ class ExitPipeline:
         
         # Execute exit order
         try:
-            from ..config import DRY_RUN
-            if DRY_RUN:
-                # Simulate exit
-                exit_result = ExitResult(
-                    success=True,
-                    exit_price=target_price,
-                    exit_size=position_size,
-                    reason=reason
+            # Live mode - always execute on exchange
+            # CANCEL BINANCE TRAILING STOP (if any)
+            try:
+                if exchange and hasattr(exchange, 'cancel_trailing_stop'):
+                    await exchange.cancel_trailing_stop(symbol)
+            except Exception:
+                pass  # Non-critical
+            
+            # Format quantity to exchange precision
+            try:
+                inner_exchange = None
+                if exchange:
+                    if hasattr(exchange, '_inner'):
+                        inner_exchange = exchange._inner
+                    elif hasattr(exchange, 'exchange'):
+                        inner_exchange = getattr(exchange, 'exchange', None)
+                
+                if inner_exchange and hasattr(inner_exchange, 'amount_to_precision'):
+                    formatted_quantity = inner_exchange.amount_to_precision(symbol, abs(position_size))
+                    final_quantity = float(formatted_quantity)
+                else:
+                    final_quantity = round(abs(position_size), 8)
+                
+                if final_quantity <= 0:
+                    return ExitResult(
+                        success=False,
+                        error=f"Exit quantity {position_size} formatted to zero (too small)"
+                    )
+            except Exception:
+                final_quantity = round(abs(position_size), 8)
+                if final_quantity <= 0:
+                    return ExitResult(
+                        success=False,
+                        error="Could not format exit quantity"
+                    )
+            
+            # Use reduceOnly=True for exits (Binance-specific safety parameter)
+            exit_params = {"reduceOnly": True}
+            
+            if use_limit:
+                # Format price to exchange precision
+                try:
+                    if inner_exchange and hasattr(inner_exchange, 'price_to_precision'):
+                        formatted_price = inner_exchange.price_to_precision(symbol, target_price)
+                        final_price = float(formatted_price)
+                    else:
+                        final_price = target_price
+                except Exception:
+                    final_price = target_price
+                
+                order = await exchange.create_order(
+                    symbol,
+                    "limit",
+                    exit_side,
+                    final_quantity,
+                    final_price,
+                    params=exit_params
                 )
             else:
-                # CANCEL BINANCE TRAILING STOP (if any)
-                try:
-                    if exchange and hasattr(exchange, 'cancel_trailing_stop'):
-                        await exchange.cancel_trailing_stop(symbol)
-                except Exception:
-                    pass  # Non-critical
-                
-                # Format quantity to exchange precision
-                try:
-                    inner_exchange = None
-                    if exchange:
-                        if hasattr(exchange, '_inner'):
-                            inner_exchange = exchange._inner
-                        elif hasattr(exchange, 'exchange'):
-                            inner_exchange = getattr(exchange, 'exchange', None)
-                    
-                    if inner_exchange and hasattr(inner_exchange, 'amount_to_precision'):
-                        formatted_quantity = inner_exchange.amount_to_precision(symbol, abs(position_size))
-                        final_quantity = float(formatted_quantity)
-                    else:
-                        final_quantity = round(abs(position_size), 8)
-                    
-                    if final_quantity <= 0:
-                        return ExitResult(
-                            success=False,
-                            error=f"Exit quantity {position_size} formatted to zero (too small)"
-                        )
-                except Exception:
-                    final_quantity = round(abs(position_size), 8)
-                    if final_quantity <= 0:
-                        return ExitResult(
-                            success=False,
-                            error="Could not format exit quantity"
-                        )
-                
-                # Use reduceOnly=True for exits (Binance-specific safety parameter)
-                exit_params = {"reduceOnly": True}
-                
-                if use_limit:
-                    # Format price to exchange precision
-                    try:
-                        if inner_exchange and hasattr(inner_exchange, 'price_to_precision'):
-                            formatted_price = inner_exchange.price_to_precision(symbol, target_price)
-                            final_price = float(formatted_price)
-                        else:
-                            final_price = target_price
-                    except Exception:
-                        final_price = target_price
-                    
-                    order = await exchange.create_order(
-                        symbol,
-                        "limit",
-                        exit_side,
-                        final_quantity,
-                        final_price,
-                        params=exit_params
-                    )
-                else:
-                    order = await exchange.create_order(
-                        symbol,
-                        "market",
-                        exit_side,
-                        final_quantity,
-                        None,
-                        params=exit_params
-                    )
-                
-                # Get filled price
-                filled_price = order.get('price') or order.get('average') or target_price
-                filled_size = order.get('filled', position_size)
-                
-                exit_result = ExitResult(
-                    success=True,
-                    exit_price=filled_price,
-                    exit_size=filled_size,
-                    reason=reason
+                order = await exchange.create_order(
+                    symbol,
+                    "market",
+                    exit_side,
+                    final_quantity,
+                    None,
+                    params=exit_params
                 )
+            
+            # Get filled price
+            filled_price = order.get('price') or order.get('average') or target_price
+            filled_size = order.get('filled', position_size)
+            
+            exit_result = ExitResult(
+                success=True,
+                exit_price=filled_price,
+                exit_size=filled_size,
+                reason=reason
+            )
             
             # Calculate costs and PnL
             entry_price = position.get('entry_price', 0)
